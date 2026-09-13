@@ -426,6 +426,79 @@ test('generate API: automatic multi-image intent, concurrency, retry, ZIP and pr
     }, 400);
     assert.match(invalid.error, /\{\{变量名\}\}/);
   }
+
+  // 11) 批量文生图（batch-generate）：无输入图逐张生成，统一风格追加到每条提示词。
+  {
+    const fixture = await fixtureProject();
+    const mark = calls.length;
+    const started = await request(`/projects/${fixture.projectId}/batch-generate`, {
+      modelId: 'sensenova',
+      prompts: ['一只橙猫在草地上', '一只蓝猫在雪地里'],
+      stylePrompt: '扁平插画风格',
+      params: { size: '1024x1024' },
+    }, 202);
+    assert.ok(started.versionId);
+    let progress;
+    await waitUntil(async () => {
+      progress = await request(`/projects/${fixture.projectId}/batch-edits/${started.taskId}`);
+      return progress.status !== 'generating';
+    });
+    assert.equal(progress.status, 'success', progress.error);
+    assert.equal(progress.textBatch, true);
+    assert.equal(progress.localEdit, false);
+    assert.equal(progress.total, 2);
+    assert.deepEqual(progress.items.map((item) => item.values), [
+      { 提示词: '一只橙猫在草地上' },
+      { 提示词: '一只蓝猫在雪地里' },
+    ]);
+    const bodies = imageBodiesSince(mark);
+    assert.equal(bodies.length, 2);
+    // 纯文生图：请求打在 generations 端点、不带输入图，且逐条附加统一风格。
+    assert.ok(bodies.every((body) => body.n === 1 && !body.image && !body.images));
+    assert.equal(bodies[0].prompt, '一只橙猫在草地上，扁平插画风格');
+    assert.equal(bodies[1].prompt, '一只蓝猫在雪地里，扁平插画风格');
+    const bundle = await request(`/projects/${fixture.projectId}`);
+    const version = bundle.versions.find((item) => item.operation === 'batch_generate');
+    assert.equal(version.status, 'success');
+    assert.equal(version.outputs.length, 2);
+    assert.equal(version.parentVersionId, null);
+    const result = bundle.messages.find((message) => message.type === 'result' && message.content.operation === 'batch_generate');
+    assert.equal(result.content.batch.completed, 2);
+    assert.deepEqual(result.content.prompts, ['一只橙猫在草地上，扁平插画风格', '一只蓝猫在雪地里，扁平插画风格']);
+
+    // 11b) 变量模板模式：逐行替换变量后生成，不叠加参考图批次约束。
+    const templateMark = calls.length;
+    const templateStarted = await request(`/projects/${fixture.projectId}/batch-generate`, {
+      modelId: 'sensenova',
+      template: '一只{{颜色}}的猫',
+      quantity: 2,
+      variables: [{ name: '颜色', values: ['红', '蓝'] }],
+      params: { size: '1024x1024' },
+    }, 202);
+    let templateProgress;
+    await waitUntil(async () => {
+      templateProgress = await request(`/projects/${fixture.projectId}/batch-edits/${templateStarted.taskId}`);
+      return templateProgress.status !== 'generating';
+    });
+    assert.equal(templateProgress.status, 'success', templateProgress.error);
+    assert.deepEqual(templateProgress.items.map((item) => item.values), [{ 颜色: '红' }, { 颜色: '蓝' }]);
+    const templateBodies = imageBodiesSince(templateMark);
+    assert.deepEqual(templateBodies.map((body) => body.prompt), ['一只红的猫', '一只蓝的猫']);
+
+    // 11c) 校验：提示词数量、不存在的变量名与能力不满足的模型都在提交时被拒绝。
+    const singlePrompt = await request(`/projects/${fixture.projectId}/batch-generate`, {
+      modelId: 'sensenova',
+      prompts: ['只有一条提示词'],
+    }, 400);
+    assert.match(singlePrompt.error, /2–50/);
+    const missingVariable = await request(`/projects/${fixture.projectId}/batch-generate`, {
+      modelId: 'sensenova',
+      template: '一只{{颜色}}的猫',
+      quantity: 2,
+      variables: [{ name: '花纹', values: ['条纹', '斑点'] }],
+    }, 400);
+    assert.match(missingVariable.error, /不存在的变量/);
+  }
 });
 
 async function waitUntil(predicate, timeout = 10000) {

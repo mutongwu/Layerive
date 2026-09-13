@@ -203,8 +203,8 @@ export function PromptGalleryModal({ visionModelId, onClose, onUsePrompt, onUseS
                   <div className="gallery-thumb">
                     {entry.image ? <img src={entry.image} alt={entry.title} loading="lazy" /> : <span className="gallery-thumb-empty">纯文本</span>}
                     <div className="gallery-card-actions" onClick={(event) => event.stopPropagation()}>
-                      <button className="gallery-use full" title="把完整提示词填入本次对话输入框" onClick={() => onUsePrompt({ ...entry, id: Number(entry.key.replace(/\D/g, '')) || 0 })}>用作对话提示词</button>
-                      <button className="gallery-use style" title="只把风格描述填入项目风格提示词" onClick={() => onUseStyle({ ...entry, id: Number(entry.key.replace(/\D/g, '')) || 0 })}>用作项目风格</button>
+                      <button className="gallery-use full" title="把完整提示词填入对话输入框；批量模式下追加到批量提示词列表" onClick={() => onUsePrompt({ ...entry, id: Number(entry.key.replace(/\D/g, '')) || 0 })}>用作提示词</button>
+                      <button className="gallery-use style" title="把风格描述填入项目风格提示词；批量文生图时填入统一风格" onClick={() => onUseStyle({ ...entry, id: Number(entry.key.replace(/\D/g, '')) || 0 })}>用作项目风格</button>
                       {entry.userEntry && <div className="gallery-user-actions">
                         <button className="gallery-manage" title="编辑这条提示词" onClick={() => openEdit(entry)}><Icon name="edit" size={12} /> 编辑</button>
                         <button className="gallery-manage danger" title="删除这条提示词" onClick={() => void remove(entry)}><Icon name="close" size={12} /> 删除</button>
@@ -226,11 +226,11 @@ export function PromptGalleryModal({ visionModelId, onClose, onUsePrompt, onUseS
             {active.image ? <img src={active.image} alt={active.title} /> : <div className="gallery-detail-placeholder">纯文本提示词</div>}
             <div className="gallery-detail-copy">
               <div className="gallery-detail-head"><strong>{active.title}</strong><span>{active.size}</span></div>
-              <div className="gallery-detail-block"><label>风格提示词（可用作项目统一风格）</label><p>{active.stylePrompt || '—'}</p></div>
+              <div className="gallery-detail-block"><label>风格提示词（可用作项目 / 批量统一风格）</label><p>{active.stylePrompt || '—'}</p></div>
               <div className="gallery-detail-block"><label>完整原始提示词</label><p className="full-prompt">{active.prompt || '—'}</p></div>
               <div className="gallery-detail-actions">
                 <button className="button secondary" onClick={() => onUseStyle({ ...active, id: Number(active.key.replace(/\D/g, '')) || 0 })}>用作项目风格</button>
-                <button className="button primary" onClick={() => onUsePrompt({ ...active, id: Number(active.key.replace(/\D/g, '')) || 0 })}>用作对话提示词</button>
+                <button className="button primary" onClick={() => onUsePrompt({ ...active, id: Number(active.key.replace(/\D/g, '')) || 0 })}>用作提示词</button>
               </div>
             </div>
             <button className="icon-button gallery-detail-close" onClick={() => setActiveKey(null)} aria-label="收起详情"><Icon name="close" size={15} /></button>

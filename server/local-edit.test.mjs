@@ -193,6 +193,51 @@ test('local edit API: all vision formats, composed provider input, history, fail
     releaseVision?.(); releaseGeneration?.();
     releaseVision = null; releaseGeneration = null;
   }
+
+  // 批量局部修改：多条指令共用同一选区与参考图，逐张写入同一个版本并保留框外像素。
+  mode = 'success';
+  {
+    const fixture = await fixtureProject();
+    const started = await request(`/projects/${fixture.projectId}/local-edit-batch`, {
+      imageId: fixture.imageId,
+      modelId: 'image',
+      visionModelId: visionFormats[0],
+      rect,
+      reference,
+      instructions: ['把主体换成红色款', '把主体换成蓝色款'],
+      params: { size: '1024x1024' },
+    }, 202);
+    let progress;
+    await waitUntil(async () => {
+      progress = await request(`/projects/${fixture.projectId}/batch-edits/${started.taskId}`);
+      return progress.status !== 'generating';
+    });
+    assert.equal(progress.status, 'success', progress.error);
+    assert.equal(progress.localEdit, true);
+    assert.equal(progress.total, 2);
+    assert.deepEqual(progress.items.map((item) => item.values), [
+      { 指令: '把主体换成红色款' },
+      { 指令: '把主体换成蓝色款' },
+    ]);
+    const bundle = await request(`/projects/${fixture.projectId}`);
+    const version = bundle.versions.filter((item) => item.operation === 'local_edit').at(-1);
+    assert.equal(version.status, 'success');
+    assert.equal(version.outputs.length, 2);
+    // 每个子项独立规划并保存各自的参考图 / 合成图素材，全部关联到版本。
+    assert.deepEqual(version.inputs.map((item) => item.sourceType).sort(), ['local_composite', 'local_composite', 'local_reference', 'local_reference', 'upload']);
+    for (const image of version.outputs) {
+      assert.equal(image.width, 120); assert.equal(image.height, 90); assert.equal(image.mimeType, 'image/png');
+      const bytes = Buffer.from(await (await fetch(base + image.url)).arrayBuffer());
+      assertOutside(await raw(sourceBytes), await raw(bytes), 120, 90, rect);
+    }
+    const single = await request(`/projects/${fixture.projectId}/local-edit-batch`, {
+      imageId: fixture.imageId,
+      modelId: 'image',
+      rect,
+      instructions: ['只有一条指令'],
+    }, 400);
+    assert.match(single.error, /2–50/);
+  }
 });
 
 async function waitUntil(predicate, timeout = 10000) {

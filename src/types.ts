@@ -62,7 +62,7 @@ export type Message = {
     versionNumber?: number;
     message?: string;
     params?: Record<string, unknown>;
-    batch?: { variableName?: string; variableNames?: string[]; values?: string[]; variables?: Array<{ name: string; values: string[] }>; prompts?: string[]; completed?: number; failed?: number; canceled?: boolean };
+    batch?: { variableName?: string; variableNames?: string[]; values?: string[]; variables?: Array<{ name: string; values: string[] }>; prompts?: string[]; local?: boolean; completed?: number; failed?: number; canceled?: boolean };
   };
   createdAt: string;
 };
@@ -125,6 +125,9 @@ export type BatchEditProgress = {
   status: 'generating' | 'success' | 'partial' | 'failed' | 'canceled';
   versionId: string | null;
   versionNumber: number | null;
+  localEdit?: boolean;
+  /** 批量文生图任务（无参考图）标记，用于区分文案。 */
+  textBatch?: boolean;
   template: string;
   variableNames: string[];
   total: number;

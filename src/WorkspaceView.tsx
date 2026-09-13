@@ -20,7 +20,7 @@ type Props = {
 type TaskKind = 'generate' | 'batch-edit' | 'text-edit' | 'local-edit' | 'outpaint' | 'enhance' | 'remove-watermark' | 'extract-asset';
 const localEditStages = { planning: '视觉模型正在理解选区与修改意图、定位主体…', compositing: '正在裁剪参考主体并合成到目标位置…', generating: '图片模型正在完成局部修改与自然融合…', preserving: '正在还原框外原图并保存结果…' };
 
-const operationLabels: Record<string, string> = { auto: '自动识别', upload: '上传原图', text_to_image: '文生图', image_to_image: '图生图', edit_prompt: '提示词改图', batch_edit: '批量处理', edit_text: '文字编辑', local_edit: '局部修改', outpaint: '扩图', enhance: '变清晰', remove_watermark: '去水印', extract_asset: '提取素材' };
+const operationLabels: Record<string, string> = { auto: '自动识别', upload: '上传原图', text_to_image: '文生图', image_to_image: '图生图', edit_prompt: '提示词改图', batch_edit: '批量处理', batch_generate: '批量文生图', edit_text: '文字编辑', local_edit: '局部修改', outpaint: '扩图', enhance: '变清晰', remove_watermark: '去水印', extract_asset: '提取素材' };
 const formatTime = (value: string) => new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' }).format(new Date(value));
 
 function batchVariableNames(template: string) {
@@ -318,7 +318,10 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
   const [outputFormat, setOutputFormat] = useState<OutputFormat>('png');
   const [transparentBg, setTransparentBg] = useState(false);
   const [count, setCount] = useState(1);
-  const [batchEditOpen, setBatchEditOpen] = useState(false);
+  // 右侧面板双模式：对话保留原输入区；批量面板承载批量改图与批量文生图。
+  const [rightMode, setRightMode] = useState<'chat' | 'batch'>('chat');
+  const [batchType, setBatchType] = useState<'edit' | 'text'>('text');
+  const [batchStylePrompt, setBatchStylePrompt] = useState('');
   const [batchTemplate, setBatchTemplate] = useState('');
   const [batchPromptTab, setBatchPromptTab] = useState<'template' | 'list'>('template');
   const [batchPromptsText, setBatchPromptsText] = useState('');
@@ -348,6 +351,9 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
   const [textEditorError, setTextEditorError] = useState('');
   const [localEditMode, setLocalEditMode] = useState(false);
   const [localEditRect, setLocalEditRect] = useState<TextSegment['rect'] | null>(null);
+  const [localBatchOpen, setLocalBatchOpen] = useState(false);
+  const [localBatchText, setLocalBatchText] = useState('');
+  const [localBatchSubmitting, setLocalBatchSubmitting] = useState(false);
   const [localEditInstruction, setLocalEditInstruction] = useState('');
   const [localEditSubmitting, setLocalEditSubmitting] = useState(false);
   const [localReference, setLocalReference] = useState<LocalEditReference | null>(null);
@@ -390,6 +396,7 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
   const currentVersion = bundle?.versions.find((version) => version.outputs.some((image) => image.id === currentImageId));
   const selectedModel = imageModels.find((model) => model.id === modelId);
   const batchEditSupported = Boolean(selectedModel?.capabilities.includes('edit_prompt'));
+  const batchTextSupported = Boolean(selectedModel?.capabilities.includes('text_to_image'));
   const selectedVisionModel = visionModels.find((model) => model.id === visionModelId);
   const compareImage = compareImageId ? imageMap.get(compareImageId) || null : null;
   const textImage = textImageId ? imageMap.get(textImageId) || null : null;
@@ -427,6 +434,16 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
           : batchFilledCount !== batchExpectedValueCount
             ? `需要填写 ${batchExpectedValueCount} 个变量值，当前已填写 ${batchFilledCount} 个`
             : null;
+  // 批量局部修改：同一选区多组指令，逐张生成并进入同一版本。
+  const localBatchLines = localBatchText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const localBatchTooLongLine = localBatchLines.findIndex((line) => line.length > 1000);
+  const localBatchError = localBatchLines.length < 2
+    ? '批量局部修改至少需要 2 条指令（每行一条）'
+    : localBatchLines.length > 50
+      ? `指令最多 50 条，当前 ${localBatchLines.length} 条，请删减后再开始`
+      : localBatchTooLongLine >= 0
+        ? `第 ${localBatchTooLongLine + 1} 行指令超过 1000 个字符，请缩短`
+        : null;
   const parentImage = useMemo(() => {
     if (!bundle || !currentVersion?.parentVersionId) return null;
     const parent = versionById.get(currentVersion.parentVersionId);
@@ -449,6 +466,7 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
       try {
         if (kind === 'batch-edit') {
           const progress = await api.getBatchEdit(projectId, taskId);
+          const batchLabel = progress.textBatch ? '批量文生图' : progress.localEdit ? '批量局部修改' : '批量处理';
           const processed = progress.completed + progress.failed;
           if (processed > batchProcessed.current) {
             batchProcessed.current = processed;
@@ -472,10 +490,10 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
             setCurrentImageId(data.project.currentImageId);
             setInputImageId(data.project.currentImageId);
           }
-          if (progress.status === 'success') notify(`批量处理已完成，共 ${progress.completed} 张。`, 'success');
-          else if (progress.status === 'partial') notify(`批量处理完成 ${progress.completed}/${progress.total} 张，${progress.failed} 张失败。`, 'error');
-          else if (progress.status === 'canceled') notify(`批量处理已取消，保留 ${progress.completed} 张结果。`, 'error');
-          else notify(progress.error || '批量处理失败，请重试。', 'error');
+          if (progress.status === 'success') notify(`${batchLabel}已完成，共 ${progress.completed} 张。`, 'success');
+          else if (progress.status === 'partial') notify(`${batchLabel}完成 ${progress.completed}/${progress.total} 张，${progress.failed} 张失败。`, 'error');
+          else if (progress.status === 'canceled') notify(`${batchLabel}已取消，保留 ${progress.completed} 张结果。`, 'error');
+          else notify(progress.error || `${batchLabel}失败，请重试。`, 'error');
           onProjectChanged();
           return;
         }
@@ -524,10 +542,13 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
 
   useEffect(() => () => stopPolling(), [stopPolling]);
 
+  // 批量模板编辑器是命令式渲染的 contenteditable，只在面板/标签页切换（或换参考图）
+  // 时按 batchTemplate 状态重建，输入过程不能重渲染，否则光标会跳。
   useEffect(() => {
-    if (!batchEditOpen || batchPromptTab !== 'template' || !batchTemplateEditorRef.current) return;
+    if (rightMode !== 'batch' || batchPromptTab !== 'template' || !batchTemplateEditorRef.current) return;
     renderBatchTemplateEditor(batchTemplateEditorRef.current, batchTemplate);
-  }, [batchEditOpen, batchPromptTab]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rightMode, batchType, batchPromptTab, currentImageId]);
 
   useEffect(() => {
     setLoading(true);
@@ -536,6 +557,7 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
       const draft = data.project.draft || {};
       setPrompt(String(draft.prompt || ''));
       setStylePrompt(String(draft.stylePrompt || ''));
+      setBatchStylePrompt(String(draft.stylePrompt || ''));
       setOperation(String(draft.operation || 'auto'));
       setModelId(String(draft.modelId || data.project.defaultModelId || activeModel));
       const savedVisionModelId = String(draft.visionModelId || '');
@@ -548,7 +570,7 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
       setInputImageId(String(draft.inputImageId || '') || null);
       initialized.current = true;
       const task = taskData.tasks[0];
-      if (task) startPolling(task.id, task.operationType === 'batch_edit' ? 'batch-edit' : task.operationType === 'edit_text' ? 'text-edit' : task.operationType === 'local_edit' ? 'local-edit' : task.operationType === 'outpaint' ? 'outpaint' : task.operationType === 'enhance' ? 'enhance' : task.operationType === 'remove_watermark' ? 'remove-watermark' : task.operationType === 'extract_asset' ? 'extract-asset' : 'generate');
+      if (task) startPolling(task.id, task.operationType === 'batch_edit' || task.operationType === 'batch_generate' ? 'batch-edit' : task.operationType === 'edit_text' ? 'text-edit' : task.operationType === 'local_edit' ? 'local-edit' : task.operationType === 'outpaint' ? 'outpaint' : task.operationType === 'enhance' ? 'enhance' : task.operationType === 'remove_watermark' ? 'remove-watermark' : task.operationType === 'extract_asset' ? 'extract-asset' : 'generate');
     }).catch((error) => notify(error.message, 'error')).finally(() => setLoading(false));
   }, [projectId, activeModel, activeVisionModel, startPolling, notify]);
 
@@ -619,18 +641,31 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
     closeExtract();
   }, [currentImageId]);
 
-  // Drop a gallery prompt into the composer, or lift its distilled style into
-  // the project-level style slot — both close the gallery so the user lands
-  // back in the workspace with the text ready to edit or send.
+  // 画廊条目的去向跟随当前面板：对话模式填入聊天输入框；批量模式追加为提示词
+  // 列表的一行（批量文生图可直接复用）。两种情况都会关闭画廊回到工作台。
   function useGalleryPrompt(entry: GalleryEntry) {
-    setPrompt((current) => (current.trim() ? `${current.trim()}\n${entry.prompt}` : entry.prompt));
     setGalleryOpen(false);
+    if (rightMode === 'batch') {
+      const existing = batchPromptsText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      if (existing.length >= 50) return notify('批量提示词列表已满 50 条，请删减后再从画廊追加。', 'error');
+      setBatchPromptTab('list');
+      setBatchPromptsText([...existing, entry.prompt].join('\n'));
+      notify(`已把完整提示词追加到批量提示词列表（${existing.length + 1} 条）`, 'success');
+      return;
+    }
+    setPrompt((current) => (current.trim() ? `${current.trim()}\n${entry.prompt}` : entry.prompt));
     notify('已把完整提示词填入对话输入框', 'success');
   }
 
   function useGalleryStyle(entry: GalleryEntry) {
-    setStylePrompt(entry.stylePrompt);
     setGalleryOpen(false);
+    // 批量文生图有独立的统一风格槽位；其余场景写入项目风格提示词。
+    if (rightMode === 'batch' && batchType === 'text') {
+      setBatchStylePrompt(entry.stylePrompt);
+      notify('已设为批量统一风格提示词，会追加到每条提示词末尾', 'success');
+      return;
+    }
+    setStylePrompt(entry.stylePrompt);
     notify('已设为项目风格提示词，文生图时自动生效', 'success');
   }
 
@@ -713,7 +748,7 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
   function onCanvasSelectionStart(event: React.PointerEvent<HTMLDivElement>) {
     if ((!localEditMode && !extractMode) || event.button !== 0 || generating || localEditSubmitting) return;
     const target = event.target as Element;
-    if (target.closest('.local-edit-panel, .extract-panel')) return;
+    if (target.closest('.local-edit-panel, .local-edit-dock, .local-batch-panel, .extract-panel')) return;
     const point = canvasPointerRatio(event);
     if (!point) return;
     event.preventDefault();
@@ -787,6 +822,7 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
     setLocalEditRect(null);
     setLocalEditInstruction('');
     setLocalReference(null);
+    setLocalBatchOpen(false);
   }
 
   function closeLocalEdit() {
@@ -798,6 +834,7 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
     setLocalEditRect(null);
     setLocalEditInstruction('');
     setLocalDragging(false);
+    setLocalBatchOpen(false);
   }
 
   async function selectLocalReference(file?: File) {
@@ -841,6 +878,31 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
       startPolling(result.taskId, 'local-edit');
     } catch (error) { setActiveTask(null); notify((error as Error).message, 'error'); }
     finally { setLocalEditSubmitting(false); }
+  }
+
+  // 批量局部修改：同一选区多组指令，复用批量任务的增量发布与进度轮询。
+  async function submitLocalBatch() {
+    if (!currentImage || !localEditRect || localBatchError || localBatchSubmitting || generating) return;
+    setLocalBatchSubmitting(true);
+    try {
+      const result = await api.localEditBatch(projectId, {
+        imageId: currentImage.id,
+        modelId,
+        visionModelId,
+        parentVersionId: currentVersion?.id || null,
+        rect: localEditRect,
+        instructions: localBatchLines,
+        reference: localReference || undefined,
+        params: { size: closestSizeForDimensions(provider, currentImage.width, currentImage.height), quality: selectedModel?.defaultParams.quality || 'auto', outputFormat: localReference ? 'png' : outputFormat, transparent: localReference ? false : transparentBg },
+      });
+      setLocalEditMode(false);
+      setLocalBatchOpen(false);
+      batchProcessed.current = 0;
+      setBatchProgress(null);
+      startPolling(result.taskId, 'batch-edit');
+      notify('批量局部修改已开始，生成结果会逐张出现。', 'success');
+    } catch (error) { notify((error as Error).message, 'error'); }
+    finally { setLocalBatchSubmitting(false); }
   }
 
   function startOutpaint() {
@@ -1057,10 +1119,12 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
     }
   }
 
-  function openBatchEdit() {
-    if (!currentImage || !batchEditSupported || generating) return;
+  // 画布浮动按钮与历史里的批量入口都指向右侧批量面板，不再弹独立弹窗。
+  function openBatchPanel() {
+    if (generating) return;
     setBatchTemplate((current) => current || prompt.trim());
-    setBatchEditOpen(true);
+    setBatchType('edit');
+    setRightMode('batch');
   }
 
   function syncBatchTemplateEditor() {
@@ -1159,29 +1223,24 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
     });
   }
 
-  async function submitBatchEdit() {
-    if (!currentImage || !batchEditSupported || batchValidationError || batchSubmitting || generating) return;
+  // 批量面板提交：改图批次以画布图片为参考，文生图批次纯提示词并附加统一风格。
+  async function submitBatch() {
+    if (batchValidationError || batchSubmitting || generating) return;
+    if (batchType === 'edit' && (!currentImage || !batchEditSupported)) return;
+    if (batchType === 'text' && !batchTextSupported) return;
     setBatchSubmitting(true);
     try {
-      const base = {
-        imageId: currentImage.id,
-        modelId,
-        parentVersionId: currentImage.versionId,
-        params: { size, quality: selectedModel?.defaultParams.quality || 'auto', outputFormat, transparent: transparentBg },
-      };
-      const result = batchPromptTab === 'list'
-        ? await api.startBatchEdit(projectId, { ...base, prompts: batchPromptLines })
-        : await api.startBatchEdit(projectId, {
-            ...base,
-            template: batchTemplate.trim(),
-            quantity: batchQuantity,
-            variables: detectedBatchVariables.map((name) => ({ name, values: batchRows.map((row) => row[name]) })),
-          });
+      const params = { size, quality: selectedModel?.defaultParams.quality || 'auto', outputFormat, transparent: transparentBg };
+      const promptsInput = batchPromptTab === 'list'
+        ? { prompts: batchPromptLines }
+        : { template: batchTemplate.trim(), quantity: batchQuantity, variables: detectedBatchVariables.map((name) => ({ name, values: batchRows.map((row) => row[name]) })) };
+      const result = batchType === 'edit'
+        ? await api.startBatchEdit(projectId, { imageId: currentImage!.id, modelId, parentVersionId: currentImage!.versionId, params, ...promptsInput })
+        : await api.startBatchGenerate(projectId, { modelId, params, stylePrompt: batchStylePrompt.trim() || undefined, ...promptsInput });
       batchProcessed.current = 0;
       setBatchProgress(null);
-      setBatchEditOpen(false);
       startPolling(result.taskId, 'batch-edit');
-      notify('批量处理已开始，生成结果会逐张出现。', 'success');
+      notify(batchType === 'edit' ? '批量处理已开始，生成结果会逐张出现。' : '批量文生图已开始，生成结果会逐张出现。', 'success');
     } catch (error) {
       notify((error as Error).message, 'error');
     } finally {
@@ -1267,6 +1326,7 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
             {!visionModels.length && <option value="">未配置视觉模型</option>}
             {visionModels.map((model) => <option key={model.id} value={model.id}>视觉 · {model.name}</option>)}
           </select>
+          <button className="gallery-open-button" title="提示词画廊：把完整提示词填入对话或批量列表，或把风格设为项目 / 批量统一风格" aria-label="提示词画廊" onClick={() => setGalleryOpen(true)}><span className="gallery-open-icon"><Icon name="gallery" size={17} /><Icon name="sparkle" size={9} /></span><span className="gallery-open-copy"><strong>提示词画廊</strong><small>灵感 · 风格 · 模板</small></span></button>
           <button className="icon-button theme-toggle" onClick={toggleTheme} title={theme === 'dark' ? '切换到亮色模式' : '切换到暗色模式'} aria-label="切换配色模式"><Icon name={theme === 'dark' ? 'sun' : 'moon'} size={16} /></button>
           <button className="icon-button" title="模型配置" onClick={onModels}><Icon name="sliders" size={17} /></button>
         </div>
@@ -1288,11 +1348,12 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
             <div className="canvas-actions"><button disabled={!currentImage} onClick={() => changeZoom(-0.25)} aria-label="缩小"><Icon name="minus" size={14} /></button><button className="zoom-label" disabled={!currentImage} onClick={() => setZoom(1)}>{Math.round(zoom * 100)}%</button><button disabled={!currentImage} onClick={() => changeZoom(0.25)} aria-label="放大"><Icon name="plus" size={14} /></button><button className="upload-image-launch" disabled={uploading} title="向当前项目添加一张图片，并将它作为下一次编辑的输入" onClick={() => fileRef.current?.click()}>{uploading ? '上传中…' : <><Icon name="plus" size={14} /> 上传图片</>}</button><button className={`local-edit-launch ${localEditMode ? 'active' : ''}`} disabled={!currentImage || generating || removingWatermark || enhancing} title={localEditMode || localEditRect ? '退出局部修改' : '框选图片区域并局部修改'} onClick={localEditMode || localEditRect ? closeLocalEdit : startLocalEdit}>{localEditMode || localEditRect ? <><Icon name="close" size={14} /> 退出局部</> : <><Icon name="box" size={14} /> 局部修改</>}</button><button className={`extract-launch ${(extractMode || extractRect) ? 'active' : ''}`} disabled={!currentImage || generating || removingWatermark || enhancing} title={(extractMode || extractRect) ? '退出提取素材' : '框选图片中的主体，提取为一张独立素材图'} onClick={(extractMode || extractRect) ? closeExtract : startExtract}>{(extractMode || extractRect) ? <><Icon name="close" size={14} /> 退出提取</> : <><Icon name="extract" size={14} /> 提取素材</>}</button><button className={`outpaint-launch ${outpaintMode ? 'active' : ''}`} disabled={!currentImage || generating || removingWatermark || enhancing} title={outpaintMode ? '退出扩图' : '扩展当前图片画布'} onClick={outpaintMode ? closeOutpaint : startOutpaint}>{outpaintMode ? <><Icon name="close" size={14} /> 退出扩图</> : <><Icon name="image" size={14} /> 扩图</>}</button><button className="enhance-launch" disabled={!currentImage || generating || removingWatermark || enhancing} title="调用改图模型提升当前图片的清晰度与细节" onClick={() => void enhanceImage()}>{enhancing ? '处理中…' : <><Icon name="sparkle" size={14} /> 变清晰</>}</button><button className="watermark-remove-launch" disabled={!currentImage || generating || removingWatermark || enhancing} title="先识别覆盖式水印，再调用改图模型修复" onClick={() => void removeWatermark()}>{removingWatermark ? '识别中…' : <><Icon name="sparkle" size={14} /> 去水印</>}</button><button disabled={!currentImage || generating || removingWatermark || enhancing} onClick={() => void openTextEditor()}>编辑文字</button><button disabled={!currentImage} onClick={openCompare}>对比</button><a className={!currentImage ? 'disabled' : ''} href={currentImage?.url} download>下载</a>{currentVersion && currentVersion.outputs.length > 1 && <button className="download-version-zip" title={`将本轮 ${currentVersion.outputs.length} 张候选图下载为 ZIP`} onClick={() => api.downloadVersionImages(projectId, currentVersion.id)}><Icon name="download" size={13} /> ZIP</button>}</div>
           </div>
           <div className={`canvas-stage ${(localEditMode || extractMode) ? 'selection-mode' : ''}`} onPointerDown={onCanvasSelectionStart} onPointerMove={onCanvasSelectionMove} onPointerUp={onCanvasSelectionEnd} onPointerCancel={onCanvasSelectionCancel}>
-            {currentImage && <button type="button" className="batch-launch" disabled={!batchEditSupported || generating} title={!batchEditSupported ? '当前模型不支持提示词改图' : '以当前画布图片为基准，用变量词条逐张批量处理'} onPointerDown={(event) => event.stopPropagation()} onClick={openBatchEdit}><Icon name="grid" size={14} /> 批量处理</button>}
+            {currentImage && <button type="button" className="batch-launch" disabled={!batchEditSupported || generating} title={!batchEditSupported ? '当前模型不支持提示词改图' : '在右侧批量面板中，以当前画布图片为基准逐张批量处理'} onPointerDown={(event) => event.stopPropagation()} onClick={openBatchPanel}><Icon name="grid" size={14} /> 批量处理</button>}
             {currentImage ? <div className={`canvas-image-wrap ${zoom !== 1 ? 'is-zoomed' : ''} ${localEditMode ? 'local-editing' : ''} ${(extractMode || extractRect) ? 'extracting' : ''} ${outpaintMode ? 'outpaint-preview-wrap' : ''}`} style={zoom !== 1 ? { width: `${zoom * 100}%` } : undefined} onContextMenu={(event) => openImageContextMenu(event, currentImage.id)}>{outpaintMode ? <div className="outpaint-preview" style={outpaintAspectRatio ? { aspectRatio: outpaintAspectRatio } : undefined}><img src={currentImage.url} alt={`扩图预览${currentVersion ? `版本 V${currentVersion.number}` : ''}`} /><span>新增画布区域</span></div> : <img src={currentImage.url} alt={`项目图片${currentVersion ? `版本 V${currentVersion.number}` : ''}`} />}{(localEditMode || localEditRect) && <div className="local-edit-surface">{localEditRect && <span className="local-edit-rect" style={{ left: `${localEditRect.x}%`, top: `${localEditRect.y}%`, width: `${localEditRect.width}%`, height: `${localEditRect.height}%` }}><em>修改区域</em></span>}</div>}{(extractMode || extractRect) && <div className="extract-surface">{extractRect && <span className="extract-rect" style={{ left: `${extractRect.x}%`, top: `${extractRect.y}%`, width: `${extractRect.width}%`, height: `${extractRect.height}%` }}><em>提取区域</em></span>}</div>}<span className="image-chip">{outpaintMode ? `目标 ${outpaintSize}` : `${currentImage.width || '—'} × ${currentImage.height || '—'}`}</span></div> : (
               <div className="canvas-empty"><div className="empty-visual"><span /><span /><span /></div><h2>开始你的第一张作品</h2><p>在右侧输入创作描述，或者上传 / 直接 Ctrl+V 粘贴一张图片进行修改。</p><button className="button secondary" onClick={() => fileRef.current?.click()}>上传初始图片</button></div>
             )}
-            {localEditMode && !localDragging && currentImage && <section className="local-edit-panel" role="dialog" aria-label="局部修改">
+            {localEditMode && !localDragging && currentImage && <div className="local-edit-dock">
+              <section className="local-edit-panel" role="dialog" aria-label="局部修改">
               <div className="local-edit-panel-head"><div><strong>局部修改</strong><span>{localEditRect ? '描述改动，或上传参考图替换选中的主体' : '可从图片内外起拖，框选需要修改的位置'}</span></div><button className="local-edit-exit" disabled={localEditSubmitting} onClick={closeLocalEdit}><Icon name="close" size={13} /> 退出</button></div>
               {localEditRect && <>
                 <input ref={localReferenceFileRef} type="file" accept="image/png,image/jpeg,image/webp" hidden onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; void selectLocalReference(file); }} />
@@ -1305,15 +1366,24 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
                 </div>
                 <textarea aria-label="局部修改要求" disabled={localEditSubmitting} value={localEditInstruction} onChange={(event) => setLocalEditInstruction(event.target.value)} placeholder={localReference ? '可不填写，由模型推断意图。也可补充：只替换头部，保留耳朵，保持原图的姿态与光影' : '例如：将桌上的咖啡杯替换成透明玻璃花瓶，保留光影和画面风格'} rows={2} />
                 {localReference && <p className="local-reference-note">智能定位 → 裁剪合成 → 自然融合。请为衔接处留出选区空间；框外保留原图，结果按原图尺寸保存为 PNG。</p>}
-                <div className="local-edit-panel-actions"><button className="button secondary" disabled={localEditSubmitting || generating} onClick={() => setLocalEditRect(null)}>重新框选</button><button className="button primary" disabled={(!localEditInstruction.trim() && !localReference) || localReferenceLoading || localEditSubmitting || generating} onClick={() => void submitLocalEdit()}>{localEditSubmitting ? '正在提交…' : localReference ? '智能替换并融合' : '应用局部修改'}</button></div>
+                <div className="local-edit-panel-actions"><button className="button secondary" disabled={localEditSubmitting || localBatchSubmitting || generating} onClick={() => setLocalEditRect(null)}>重新框选</button><button className="button secondary" disabled={localEditSubmitting || localBatchSubmitting || generating} onClick={() => setLocalBatchOpen((open) => !open)}>批量修改</button><button className="button primary" disabled={(!localEditInstruction.trim() && !localReference) || localReferenceLoading || localEditSubmitting || localBatchSubmitting || generating} onClick={() => void submitLocalEdit()}>{localEditSubmitting ? '正在提交…' : localReference ? '智能替换并融合' : '应用局部修改'}</button></div>
               </>}
-            </section>}
+            </section>
+              {localEditRect && localBatchOpen && <aside className="local-batch-panel" role="dialog" aria-label="批量局部修改">
+                <div className="local-edit-panel-head"><div><strong>批量局部修改</strong><span>同一选区逐张尝试多组指令，结果进入同一版本</span></div><button className="local-edit-exit" disabled={localBatchSubmitting} onClick={() => setLocalBatchOpen(false)}><Icon name="close" size={13} /> 收起</button></div>
+                <textarea aria-label="批量修改指令列表" value={localBatchText} onChange={(event) => setLocalBatchText(event.target.value)} rows={7} spellCheck={false} placeholder={'每行一条修改指令，空行自动忽略。\n例如：\n把帽子换成红色贝雷帽\n把帽子换成蓝色棒球帽'} />
+                <small className={localBatchLines.length >= 2 && !localBatchError ? 'local-batch-count valid' : 'local-batch-count'}>{localBatchLines.length ? `已识别 ${localBatchLines.length} 条指令，将生成 ${localBatchLines.length} 张；2–50 条，单条不超过 1000 字符。` : '每行一条指令，空行自动忽略；2–50 条，单条不超过 1000 字符。'}</small>
+                {localReference && <p className="local-batch-reference">已附参考图“{localReference.name || '参考图'}”，每条指令都会基于它做替换融合。</p>}
+                {localBatchLines.length > 0 && localBatchError && <p className="batch-validation-error">{localBatchError}</p>}
+                <div className="local-edit-panel-actions"><button className="button secondary" disabled={localBatchSubmitting} onClick={() => setLocalBatchOpen(false)}>收起</button><button className="button primary" disabled={Boolean(localBatchError) || localBatchSubmitting || generating || localReferenceLoading} onClick={() => void submitLocalBatch()}>{localBatchSubmitting ? '正在创建批次…' : `开始批量修改 ${localBatchLines.length} 张`}</button></div>
+              </aside>}
+            </div>}
             {outpaintMode && currentImage && <section className="outpaint-panel"><div className="outpaint-panel-head"><div><strong>扩图</strong><span>选择当前模型支持的目标画布比例</span></div><button className="outpaint-exit" onClick={closeOutpaint}><Icon name="close" size={13} /> 退出</button></div><div className="outpaint-size-list">{sizesForProvider(provider).map((option) => <button key={option.value} className={option.value === outpaintSize ? 'active' : ''} onClick={() => setOutpaintSize(option.value)}><strong>{option.ratio}</strong><span>{option.value}</span></button>)}</div><p className="outpaint-summary">原图将居中保留，绿色虚线框内的新增区域会由模型自然延展补全。</p><div className="outpaint-panel-actions"><button className="button secondary" onClick={closeOutpaint}>取消</button><button className="button primary" disabled={!outpaintSize || outpaintSubmitting || generating} onClick={() => void submitOutpaint()}>{outpaintSubmitting ? '正在创建扩图任务…' : '确认扩图'}</button></div></section>}
             {(extractMode || extractRect) && !extractDragging && currentImage && <section className="extract-panel"><div className="extract-panel-head"><div><strong>提取素材</strong><span>{extractRect ? '识别模型会聚焦框选主体，并剔除圈入的边缘干扰' : '可从图片内外起拖，框选想提取的内容'}</span></div><button className="extract-exit" onClick={closeExtract}><Icon name="close" size={13} /> 退出</button></div>{extractRect && <><div className="extract-preview">{extractPreview ? <img src={extractPreview.dataUrl} alt="提取区域截图预览" /> : <span className="extract-preview-loading"><span className="spinner" />正在生成截图…</span>}{extractPreview && <small>{extractPreview.padded ? '已自动补边 · ' : ''}{extractPreview.width} × {extractPreview.height}</small>}</div><textarea value={extractHint} onChange={(event) => setExtractHint(event.target.value)} placeholder="可选补充说明，例如：只要中间的银幕，去掉两侧的座椅" rows={2} /><div className="extract-panel-actions"><button className="button secondary" onClick={() => { setExtractRect(null); setExtractPreview(null); }}>重新框选</button><button className="button primary" disabled={!extractPreview || extractSubmitting || generating} onClick={() => void submitExtract()}>{extractSubmitting ? '正在识别与规划…' : '提取为独立素材'}</button></div></>}</section>}
           </div>
           {batchProgress && <section className={`batch-progress-panel ${batchProgress.status}`} aria-live="polite">
             <div className="batch-progress-head">
-              <div><strong>批量处理 · {batchProgress.completed}/{batchProgress.total}</strong><span>{batchProgress.status === 'generating' ? `剩余 ${batchProgress.remaining} 张 · ${formatRemainingTime(batchProgress.estimatedRemainingSeconds)}` : batchProgress.status === 'success' ? '全部生成完成' : batchProgress.status === 'partial' ? `已结束 · ${batchProgress.failed} 张失败` : batchProgress.status === 'canceled' ? '已取消' : '生成失败'}</span></div>
+              <div><strong>{batchProgress.textBatch ? '批量文生图' : batchProgress.localEdit ? '批量局部修改' : '批量处理'} · {batchProgress.completed}/{batchProgress.total}</strong><span>{batchProgress.status === 'generating' ? `剩余 ${batchProgress.remaining} 张 · ${formatRemainingTime(batchProgress.estimatedRemainingSeconds)}` : batchProgress.status === 'success' ? '全部生成完成' : batchProgress.status === 'partial' ? `已结束 · ${batchProgress.failed} 张失败` : batchProgress.status === 'canceled' ? '已取消' : '生成失败'}</span></div>
               {batchProgress.status === 'generating' ? <button className="button secondary" onClick={() => void cancelActiveTask()}>取消批次</button> : <button className="icon-button" title="收起批量结果" onClick={() => setBatchProgress(null)}><Icon name="close" size={14} /></button>}
             </div>
             <div className="batch-progress-track"><span style={{ width: `${Math.round(((batchProgress.completed + batchProgress.failed) / Math.max(1, batchProgress.total)) * 100)}%` }} /></div>
@@ -1329,21 +1399,31 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
           {currentVersion && currentVersion.outputs.length > 1 && batchProgress?.versionId !== currentVersion.id && <div className="candidate-strip"><span>本轮候选</span>{currentVersion.outputs.map((image, index) => <button key={image.id} className={image.id === currentImageId ? 'active' : ''} title="查看并使用这张候选图继续创作" onClick={() => useImage(image)} onContextMenu={(event) => openImageContextMenu(event, image.id)}><img src={thumbUrl(image)} alt={`候选结果 ${index + 1}`} loading="lazy" /></button>)}</div>}
         </section>
 
-        <aside className="conversation-panel">
-          <div className="conversation-title"><div><p className="eyebrow">CONVERSATION</p><h2>项目对话</h2></div><div className="conversation-title-actions"><button className="gallery-open-button" title="浏览提示词画廊，复用提示词或风格" onClick={() => setGalleryOpen(true)}><span className="gallery-open-icon"><Icon name="gallery" size={17} /><Icon name="sparkle" size={9} /></span><span className="gallery-open-copy"><strong>提示词画廊</strong><small>灵感 · 风格 · 模板</small></span></button><button className="icon-button" title="定位最新消息" onClick={() => messagesEnd.current?.scrollIntoView({ behavior: 'smooth' })}><Icon name="down" size={16} /></button></div></div>
+        <aside className={`conversation-panel ${rightMode === 'batch' ? 'batch-mode' : ''}`}>
+          <div className="conversation-title">
+            <div><p className="eyebrow">{rightMode === 'batch' ? 'BATCH STUDIO' : 'CONVERSATION'}</p><h2>{rightMode === 'batch' ? '批量生成' : '项目对话'}</h2></div>
+            <div className="conversation-title-actions">
+              <div className="panel-mode-tabs" role="tablist" aria-label="右侧面板模式">
+                <button type="button" role="tab" aria-selected={rightMode === 'chat'} className={rightMode === 'chat' ? 'active' : ''} onClick={() => setRightMode('chat')}>对话</button>
+                <button type="button" role="tab" aria-selected={rightMode === 'batch'} className={rightMode === 'batch' ? 'active' : ''} onClick={() => setRightMode('batch')}>批量</button>
+              </div>
+              {rightMode === 'chat' && <button className="icon-button" title="定位最新消息" onClick={() => messagesEnd.current?.scrollIntoView({ behavior: 'smooth' })}><Icon name="down" size={16} /></button>}
+            </div>
+          </div>
+          {rightMode === 'chat' ? <>
           <div className="message-list">
             {bundle.messages.map((message) => {
               if (message.role === 'system') return <div className="system-message" key={message.id}>{message.content.text}</div>;
               if (message.role === 'user') {
                 const attached = message.content.inputImageId ? imageMap.get(message.content.inputImageId) : null;
-                return <article className="message user-message" key={message.id}><div className="message-meta"><strong>你</strong><span>{formatTime(message.createdAt)}</span></div>{attached && <img className="message-attachment" src={thumbUrl(attached)} alt="输入图片" loading="lazy" />}<p>{message.content.prompt || '基于所选图片继续创作'}</p><div className="message-params"><span>{operationLabels[message.content.operation || 'auto']}</span><span>{message.content.modelName}</span>{message.content.batch?.values && <span>{message.content.batch.values.length} 个变量值</span>}{message.content.batch?.prompts && <span>{message.content.batch.prompts.length} 条提示词</span>}{message.content.splitPrompts && <span>每张不同</span>}</div></article>;
+                return <article className="message user-message" key={message.id}><div className="message-meta"><strong>你</strong><span>{formatTime(message.createdAt)}</span></div>{attached && <img className="message-attachment" src={thumbUrl(attached)} alt="输入图片" loading="lazy" />}<p>{message.content.prompt || '基于所选图片继续创作'}</p><div className="message-params"><span>{operationLabels[message.content.operation || 'auto']}</span><span>{message.content.modelName}</span>{message.content.batch?.values && <span>{message.content.batch.values.length} 个变量值</span>}{message.content.batch?.prompts && <span>{message.content.batch.local ? `${message.content.batch.prompts.length} 条指令` : `${message.content.batch.prompts.length} 条提示词`}</span>}{message.content.splitPrompts && <span>每张不同</span>}</div></article>;
               }
               if (message.type === 'canceled') return <article className="message canceled-message" key={message.id}><div className="message-meta"><strong>已取消</strong><span>{formatTime(message.createdAt)}</span></div><p>{message.content.message}</p>{message.content.prompt && <button onClick={() => setPrompt(message.content.prompt || '')}>恢复提示词</button>}</article>;
               if (message.type === 'error') return <article className="message error-message" key={message.id}><div className="message-meta"><strong>生成失败</strong><span>{formatTime(message.createdAt)}</span></div><p>{message.content.message}</p><button onClick={() => setPrompt(message.content.prompt || '')}>恢复提示词</button></article>;
               const outputs = (message.content.outputImageIds || []).map((id) => imageMap.get(id)).filter(Boolean) as ProjectImage[];
-              return <article className="message assistant-message" key={message.id}><div className="message-meta"><strong>Layerive</strong><span>V{message.content.versionNumber} · {formatTime(message.createdAt)}</span></div><p>{message.content.operation === 'batch_edit' ? `批量处理已生成 ${outputs.length} 张${message.content.batch?.failed ? `，${message.content.batch.failed} 张失败` : ''}。` : `已完成生成，得到 ${outputs.length} 张候选图片。`}</p><div className={`message-gallery count-${outputs.length}`}>{outputs.map((image, index) => <button key={image.id} title={message.content.prompts?.[index] ? `本张提示词：${message.content.prompts[index]}` : '查看并使用这张候选图继续创作'} onClick={() => useImage(image)} onContextMenu={(event) => openImageContextMenu(event, image.id)}><img src={thumbUrl(image)} alt="生成结果" loading="lazy" /></button>)}</div><div className="message-actions"><button onClick={() => { const first = outputs[0]; if (first) useImage(first); }}>使用此轮继续</button><button onClick={() => setPrompt(message.content.prompt || '')}>复用提示词</button></div></article>;
+              return <article className="message assistant-message" key={message.id}><div className="message-meta"><strong>Layerive</strong><span>V{message.content.versionNumber} · {formatTime(message.createdAt)}</span></div><p>{message.content.batch?.local ? `批量局部修改已生成 ${outputs.length} 张${message.content.batch?.failed ? `，${message.content.batch.failed} 张失败` : ''}。` : message.content.operation === 'batch_generate' ? `批量文生图已生成 ${outputs.length} 张${message.content.batch?.failed ? `，${message.content.batch.failed} 张失败` : ''}。` : message.content.operation === 'batch_edit' ? `批量处理已生成 ${outputs.length} 张${message.content.batch?.failed ? `，${message.content.batch.failed} 张失败` : ''}。` : `已完成生成，得到 ${outputs.length} 张候选图片。`}</p><div className={`message-gallery count-${outputs.length}`}>{outputs.map((image, index) => <button key={image.id} title={message.content.prompts?.[index] ? `本张提示词：${message.content.prompts[index]}` : '查看并使用这张候选图继续创作'} onClick={() => useImage(image)} onContextMenu={(event) => openImageContextMenu(event, image.id)}><img src={thumbUrl(image)} alt="生成结果" loading="lazy" /></button>)}</div><div className="message-actions"><button onClick={() => { const first = outputs[0]; if (first) useImage(first); }}>使用此轮继续</button><button onClick={() => setPrompt(message.content.prompt || '')}>复用提示词</button></div></article>;
             })}
-            {generating && <article className="message generating-message"><div className="message-meta"><strong>Layerive</strong><span>{activeTask?.id ? '正在生成' : '正在准备'}</span></div><div className="generation-progress"><span /><span /><span /></div><p>{activeTask?.kind === 'batch-edit' ? `批量处理正在逐张处理${batchProgress ? `，已完成 ${batchProgress.completed}/${batchProgress.total} 张` : ''}。结果会实时显示在画布下方。` : activeTask?.kind === 'local-edit' ? localEditStages[activeTask.stage || 'planning'] : activeTask?.kind === 'text-edit' && !activeTask.id ? '视觉模型正在整理文字修改要求，随后将自动开始改图。' : activeTask?.kind === 'generate' && activeTask.stage === 'planning' ? '视觉模型正在判断多图意图，随后会自动选择普通候选或分别生成。' : `${selectedModel?.name || '图片模型'} 正在创作 ${count} 张图片，完成后会自动保存为同一版本的候选图。`}</p>{activeTask?.id && <button className="cancel-task-button" onClick={() => void cancelActiveTask()}>取消任务</button>}</article>}
+            {generating && <article className="message generating-message"><div className="message-meta"><strong>Layerive</strong><span>{activeTask?.id ? '正在生成' : '正在准备'}</span></div><div className="generation-progress"><span /><span /><span /></div><p>{activeTask?.kind === 'batch-edit' ? `${batchProgress?.textBatch ? '批量文生图' : batchProgress?.localEdit ? '批量局部修改' : '批量处理'}正在逐张处理${batchProgress ? `，已完成 ${batchProgress.completed}/${batchProgress.total} 张` : ''}。结果会实时显示在画布下方。` : activeTask?.kind === 'local-edit' ? localEditStages[activeTask.stage || 'planning'] : activeTask?.kind === 'text-edit' && !activeTask.id ? '视觉模型正在整理文字修改要求，随后将自动开始改图。' : activeTask?.kind === 'generate' && activeTask.stage === 'planning' ? '视觉模型正在判断多图意图，随后会自动选择普通候选或分别生成。' : `${selectedModel?.name || '图片模型'} 正在创作 ${count} 张图片，完成后会自动保存为同一版本的候选图。`}</p>{activeTask?.id && <button className="cancel-task-button" onClick={() => void cancelActiveTask()}>取消任务</button>}</article>}
             <div ref={messagesEnd} />
           </div>
 
@@ -1372,50 +1452,68 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
             </div>
             <input ref={fileRef} hidden type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => event.target.files?.[0] && void upload(event.target.files[0])} />
           </div>
+          </> : <div className="batch-panel">
+            <div className="batch-panel-scroll">
+            <div className="batch-type-tabs" role="tablist" aria-label="批量类型">
+              <button type="button" role="tab" aria-selected={batchType === 'edit'} className={batchType === 'edit' ? 'active' : ''} disabled={!batchEditSupported} title={!batchEditSupported ? '当前模型不支持提示词改图' : '以画布当前图片为基准逐张改图'} onClick={() => setBatchType('edit')}><strong>批量改图</strong><small>基于画布图片</small></button>
+              <button type="button" role="tab" aria-selected={batchType === 'text'} className={batchType === 'text' ? 'active' : ''} disabled={!batchTextSupported} title={!batchTextSupported ? '当前模型不支持文生图' : '每行提示词独立出图，可统一风格'} onClick={() => setBatchType('text')}><strong>批量文生图</strong><small>纯提示词 · 统一风格</small></button>
+            </div>
+            {batchType === 'edit'
+              ? currentImage
+                ? <div className="batch-edit-source"><img src={thumbUrl(currentImage)} alt="批量处理参考图" /><div><strong>统一参考图</strong><span>{currentImage.width || '—'} × {currentImage.height || '—'} · {selectedModel?.name || '当前图片模型'}</span></div></div>
+                : <div className="batch-panel-hint">请先在画布中选择一张图片，作为批量改图的统一参考图。</div>
+              : <div className="batch-generate-params">
+                  <label className="batch-param"><span>尺寸</span><select value={size} onChange={(event) => setSize(event.target.value)} title="批量文生图输出尺寸（宽高比）">{sizesForProvider(provider).map((option) => <option key={option.value} value={option.value}>{option.ratio} · {option.value}</option>)}{!isValidSizeForProvider(provider, size) && <option value={size}>{size}</option>}</select></label>
+                  {provider === 'openai' && <label className="batch-param"><span>格式</span><select value={outputFormat} onChange={(event) => setOutputFormat(event.target.value as OutputFormat)} title="输出格式">{OUTPUT_FORMATS.map((format) => <option key={format.value} value={format.value}>{format.label}</option>)}</select></label>}
+                  {provider === 'openai' && <button type="button" className={`batch-transparent-toggle ${transparentBg ? 'active' : ''}`} disabled={outputFormat === 'jpeg'} title={outputFormat === 'jpeg' ? 'JPEG 不支持透明背景' : '生成透明背景图片'} onClick={() => setTransparentBg((value) => !value)}>透明</button>}
+                </div>}
+            <div className="batch-tabs" role="tablist" aria-label="提示词录入方式">
+              <button type="button" role="tab" aria-selected={batchPromptTab === 'template'} className={batchPromptTab === 'template' ? 'active' : ''} onClick={() => setBatchPromptTab('template')}><strong>变量模板</strong><small>插入变量 · 矩阵填值</small></button>
+              <button type="button" role="tab" aria-selected={batchPromptTab === 'list'} className={batchPromptTab === 'list' ? 'active' : ''} onClick={() => setBatchPromptTab('list')}><strong>提示词列表</strong><small>每行一条 · 可导入 TXT</small></button>
+            </div>
+            {batchPromptTab === 'template' ? <>
+              <div className="field batch-template-field">
+                <div className="batch-field-heading"><span>提示词模板</span><div className="batch-heading-actions"><button type="button" disabled={detectedBatchVariables.length >= 10} onMouseDown={(event) => event.preventDefault()} onClick={insertBatchVariable}><Icon name="plus" size={13} /> 插入变量</button></div></div>
+                <div ref={batchTemplateEditorRef} className="batch-template-editor" contentEditable suppressContentEditableWarning role="textbox" aria-multiline="true" aria-label="批量提示词模板" data-placeholder="例如：生成一致的怪物，头部为［变量］，服装为［变量］" onInput={syncBatchTemplateEditor} onClick={handleBatchTemplateClick} onPaste={handleBatchTemplatePaste} />
+                <small>在光标处可插入多个紫色变量标签；标签本身不可编辑，点击标签内的 × 可移除。所有张共用这一个模板，仅替换变量内容。</small>
+              </div>
+              <label className="field batch-quantity-field"><span>生成数量</span><input type="number" min="2" max="50" value={batchQuantity} onChange={(event) => changeBatchQuantity(Number(event.target.value))} /><small>支持 2–50 张；数量会同步增减下方输入框。</small></label>
+              <div className="field batch-values-field"><span>变量值</span>{detectedBatchVariables.length
+                ? <div className="batch-value-table"><div className="batch-value-row batch-value-header" style={{ gridTemplateColumns: `64px repeat(${detectedBatchVariables.length}, minmax(132px, 1fr))` }}><span>图片</span>{detectedBatchVariables.map((name) => <strong key={name}>{name}</strong>)}</div>{batchRows.map((row, index) => <div key={index} className="batch-value-row" style={{ gridTemplateColumns: `64px repeat(${detectedBatchVariables.length}, minmax(132px, 1fr))` }}><span>第 {index + 1} 张</span>{detectedBatchVariables.map((name) => <input key={name} className={row[name] ? 'filled' : ''} value={batchVariableValues[name]?.[index] || ''} onChange={(event) => updateBatchValue(name, index, event.target.value)} placeholder={index === 0 ? `输入${name}` : ''} aria-label={`第 ${index + 1} 张的${name}`} />)}</div>)}</div>
+                : <div className="batch-values-empty">插入变量后，这里会按“图片 × 变量”生成输入框。</div>}<small className={batchExpectedValueCount > 0 && batchFilledCount === batchExpectedValueCount ? 'valid' : ''}>已填写 {batchFilledCount} / {batchExpectedValueCount} 个输入框</small></div>
+            </> : <div className="field batch-template-field">
+              <div className="batch-field-heading"><span>提示词内容</span><div className="batch-heading-actions"><button type="button" title="导入 txt 文件批量生成：每行一条提示词，空行忽略，行数即生成数量（单批 2–50 条，单条不超过 1000 字符）" onMouseDown={(event) => event.preventDefault()} onClick={() => batchImportFileRef.current?.click()}><Icon name="download" size={13} /> 导入 TXT</button></div></div>
+              <textarea className="batch-prompts-editor" value={batchPromptsText} onChange={(event) => setBatchPromptsText(event.target.value)} rows={8} spellCheck={false} aria-label="批量提示词列表" placeholder={'每行一条提示词，空行会自动忽略；也可直接粘贴多行文本。\n例如：\n给主体戴上红色贝雷帽，保持背景与光影不变\n把背景替换成雪夜街道，主体保持一致'} />
+              <small className={batchValidationError === null ? 'valid' : ''}>{batchPromptLines.length ? `已识别 ${batchPromptLines.length} 条提示词，将生成 ${batchPromptLines.length} 张；数量按行数自动确定。` : '每行一条提示词，空行会自动忽略；可点击“导入 TXT”选择 txt 文件。'}</small>
+              <details className="batch-import-help">
+                <summary>导入格式说明</summary>
+                <ul>
+                  <li>txt 文件每行一条提示词，空行会自动忽略；也可以直接在上方文本框粘贴多行文本。</li>
+                  <li>识别到多少行就生成多少张（单批 2–50 条；超过 50 行时仅保留前 50 行）。</li>
+                  <li>单条提示词不超过 1000 字符，超限行会标明行号。</li>
+                  <li>每行会直接作为该张图片的完整提示词；导入后仍可手动增删改，再开始生成。</li>
+                </ul>
+              </details>
+            </div>}
+            {batchType === 'text' && <label className="field batch-style-field"><span>统一风格提示词（可选）</span><textarea value={batchStylePrompt} onChange={(event) => setBatchStylePrompt(event.target.value)} rows={2} placeholder="例如：扁平插画风格，柔和马卡龙配色，粗描边。会追加到每条提示词末尾，保证整批画风统一。" /><small>默认带入项目风格提示词，可单独修改；留空则每条提示词独立生效。</small></label>}
+            <div className="batch-edit-note"><Icon name="sparkle" size={15} /><span>{batchType === 'edit'
+              ? batchPromptTab === 'list'
+                ? '任务会按列表顺序逐张生成，每行都会以画布图片为输入独立调用一次模型，可能按张计费。每完成一张就立即保存并展示，失败项不会阻断后续图片。'
+                : '任务会按词条顺序逐张生成。每完成一张就立即保存并展示，失败项不会阻断后续图片；每个词条都会独立调用一次模型，可能按张计费。'
+              : batchPromptTab === 'list'
+                ? '每行提示词独立生成一张文生图，互不影响；统一风格提示词会追加到每条提示词末尾。每完成一张立即保存，失败项不会阻断后续图片。'
+                : '每个变量词条组合独立生成一张文生图；统一风格提示词会追加到每条提示词末尾。每完成一张立即保存，失败项不会阻断后续图片。'}</span></div>
+            {batchValidationError && <p className="batch-validation-error">{batchValidationError}</p>}
+            </div>
+            <div className="batch-panel-footer">
+              <div className="batch-panel-actions">
+                <button className="button primary" disabled={Boolean(batchValidationError) || batchSubmitting || generating || (batchType === 'edit' && !currentImage)} onClick={() => void submitBatch()}>{batchSubmitting ? '正在创建批次…' : `开始生成 ${batchPromptTab === 'list' ? batchPromptLines.length : batchQuantity} 张`}</button>
+              </div>
+            </div>
+            <input ref={batchImportFileRef} hidden type="file" accept=".txt,text/plain" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; if (file) void importBatchPromptFile(file); }} />
+          </div>}
         </aside>
       </section>
-
-      {batchEditOpen && currentImage && <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !batchSubmitting && setBatchEditOpen(false)}>
-        <section className="batch-edit-modal" role="dialog" aria-modal="true" aria-labelledby="batch-edit-title">
-          <div className="modal-heading">
-            <div><p className="eyebrow">VARIABLE BATCH EDIT</p><h2 id="batch-edit-title">批量处理</h2><small>以画布当前图片为基准逐张生成同一版本的批量结果；支持变量模板或提示词列表两种录入方式。</small></div>
-            <button className="icon-button" disabled={batchSubmitting} onClick={() => setBatchEditOpen(false)}><Icon name="close" size={16} /></button>
-          </div>
-          <div className="batch-edit-source"><img src={thumbUrl(currentImage)} alt="批量处理参考图" /><div><strong>统一参考图</strong><span>{currentImage.width || '—'} × {currentImage.height || '—'} · {selectedModel?.name || '当前图片模型'}</span></div></div>
-          <div className="batch-tabs" role="tablist" aria-label="提示词录入方式">
-            <button type="button" role="tab" aria-selected={batchPromptTab === 'template'} className={batchPromptTab === 'template' ? 'active' : ''} onClick={() => setBatchPromptTab('template')}><strong>变量模板</strong><small>插入变量 · 矩阵填值</small></button>
-            <button type="button" role="tab" aria-selected={batchPromptTab === 'list'} className={batchPromptTab === 'list' ? 'active' : ''} onClick={() => setBatchPromptTab('list')}><strong>提示词列表</strong><small>每行一条 · 可导入 TXT</small></button>
-          </div>
-          {batchPromptTab === 'template' ? <>
-            <div className="field batch-template-field">
-              <div className="batch-field-heading"><span>提示词模板</span><div className="batch-heading-actions"><button type="button" disabled={detectedBatchVariables.length >= 10} onMouseDown={(event) => event.preventDefault()} onClick={insertBatchVariable}><Icon name="plus" size={13} /> 插入变量</button></div></div>
-              <div ref={batchTemplateEditorRef} className="batch-template-editor" contentEditable suppressContentEditableWarning role="textbox" aria-multiline="true" aria-label="批量处理提示词模板" data-placeholder="例如：生成一致的怪物，头部为［变量］，服装为［变量］" onInput={syncBatchTemplateEditor} onClick={handleBatchTemplateClick} onPaste={handleBatchTemplatePaste} />
-              <small>在光标处可插入多个紫色变量标签；标签本身不可编辑，点击标签内的 × 可移除。所有张共用这一个模板，仅替换变量内容。</small>
-            </div>
-            <label className="field batch-quantity-field"><span>生成数量</span><input type="number" min="2" max="50" value={batchQuantity} onChange={(event) => changeBatchQuantity(Number(event.target.value))} /><small>支持 2–50 张；数量会同步增减下方输入框。</small></label>
-            <div className="field batch-values-field"><span>变量值</span>{detectedBatchVariables.length
-              ? <div className="batch-value-table"><div className="batch-value-row batch-value-header" style={{ gridTemplateColumns: `64px repeat(${detectedBatchVariables.length}, minmax(132px, 1fr))` }}><span>图片</span>{detectedBatchVariables.map((name) => <strong key={name}>{name}</strong>)}</div>{batchRows.map((row, index) => <div key={index} className="batch-value-row" style={{ gridTemplateColumns: `64px repeat(${detectedBatchVariables.length}, minmax(132px, 1fr))` }}><span>第 {index + 1} 张</span>{detectedBatchVariables.map((name) => <input key={name} className={row[name] ? 'filled' : ''} value={batchVariableValues[name]?.[index] || ''} onChange={(event) => updateBatchValue(name, index, event.target.value)} placeholder={index === 0 ? `输入${name}` : ''} aria-label={`第 ${index + 1} 张的${name}`} />)}</div>)}</div>
-              : <div className="batch-values-empty">插入变量后，这里会按“图片 × 变量”生成输入框。</div>}<small className={batchExpectedValueCount > 0 && batchFilledCount === batchExpectedValueCount ? 'valid' : ''}>已填写 {batchFilledCount} / {batchExpectedValueCount} 个输入框</small></div>
-          </> : <div className="field batch-template-field">
-            <div className="batch-field-heading"><span>提示词内容</span><div className="batch-heading-actions"><button type="button" title="导入 txt 文件批量生成：每行一条提示词，空行忽略，行数即生成数量（单批 2–50 条，单条不超过 1000 字符）" onMouseDown={(event) => event.preventDefault()} onClick={() => batchImportFileRef.current?.click()}><Icon name="download" size={13} /> 导入 TXT</button></div></div>
-            <textarea className="batch-prompts-editor" value={batchPromptsText} onChange={(event) => setBatchPromptsText(event.target.value)} rows={9} spellCheck={false} aria-label="批量提示词列表" placeholder={'每行一条提示词，空行会自动忽略；也可直接粘贴多行文本。\n例如：\n给主体戴上红色贝雷帽，保持背景与光影不变\n把背景替换成雪夜街道，主体保持一致'} />
-            <small className={batchValidationError === null ? 'valid' : ''}>{batchPromptLines.length ? `已识别 ${batchPromptLines.length} 条提示词，将生成 ${batchPromptLines.length} 张；数量按行数自动确定。` : '每行一条提示词，空行会自动忽略；可点击“导入 TXT”选择 txt 文件。'}</small>
-            <details className="batch-import-help">
-              <summary>导入格式说明</summary>
-              <ul>
-                <li>txt 文件每行一条提示词，空行会自动忽略；也可以直接在上方文本框粘贴多行文本。</li>
-                <li>识别到多少行就生成多少张（单批 2–50 条；超过 50 行时仅保留前 50 行）。</li>
-                <li>单条提示词不超过 1000 字符，超限行会标明行号。</li>
-                <li>每行会直接作为该张图片的完整提示词，以画布当前图片为输入逐张生成；导入后仍可手动增删改，再开始生成。</li>
-              </ul>
-            </details>
-          </div>}
-          <div className="batch-edit-note"><Icon name="sparkle" size={15} /><span>{batchPromptTab === 'list' ? '任务会按列表顺序逐张生成，每行都会以画布图片为输入独立调用一次模型，可能按张计费。每完成一张就立即保存并展示，失败项不会阻断后续图片。' : '任务会按词条顺序逐张生成。每完成一张就立即保存并展示，失败项不会阻断后续图片；每个词条都会独立调用一次模型，可能按张计费。'}</span></div>
-          {batchValidationError && <p className="batch-validation-error">{batchValidationError}</p>}
-          <div className="modal-actions"><button className="button secondary" disabled={batchSubmitting} onClick={() => setBatchEditOpen(false)}>取消</button><button className="button primary" disabled={Boolean(batchValidationError) || batchSubmitting} onClick={() => void submitBatchEdit()}>{batchSubmitting ? '正在创建批次…' : `开始生成 ${batchPromptTab === 'list' ? batchPromptLines.length : batchQuantity} 张`}</button></div>
-          <input ref={batchImportFileRef} hidden type="file" accept=".txt,text/plain" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; if (file) void importBatchPromptFile(file); }} />
-        </section>
-      </div>}
 
       {compareOpen && currentImage && compareImage && <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setCompareOpen(false)}>
         <section className="compare-modal" role="dialog" aria-modal="true" aria-labelledby="compare-title">

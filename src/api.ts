@@ -51,6 +51,8 @@ export const api = {
     request<GenerateResult>(`/api/projects/${id}/generate`, { method: 'POST', body: JSON.stringify(input) }),
   startBatchEdit: (id: string, input: { imageId: string; modelId: string; parentVersionId?: string | null; template?: string; quantity?: number; variables?: Array<{ name: string; values: string[] }>; prompts?: string[]; params?: Record<string, unknown> }) =>
     request<BatchEditResult>(`/api/projects/${id}/batch-edit`, { method: 'POST', body: JSON.stringify(input) }),
+  startBatchGenerate: (id: string, input: { modelId: string; parentVersionId?: string | null; template?: string; quantity?: number; variables?: Array<{ name: string; values: string[] }>; prompts?: string[]; stylePrompt?: string; params?: Record<string, unknown> }) =>
+    request<BatchEditResult>(`/api/projects/${id}/batch-generate`, { method: 'POST', body: JSON.stringify(input) }),
   getBatchEdit: (id: string, taskId: string) => request<BatchEditProgress>(`/api/projects/${id}/batch-edits/${taskId}`),
   listGeneratingTasks: (id: string) => request<{ tasks: GenerationTask[] }>(`/api/projects/${id}/tasks`),
   getTask: (id: string, taskId: string) => request<GenerationTask>(`/api/projects/${id}/tasks/${taskId}`),
@@ -61,6 +63,8 @@ export const api = {
     request<GenerateResult>(`/api/projects/${id}/edit-text`, { method: 'POST', body: JSON.stringify(input) }),
   localEdit: (id: string, input: { imageId: string; modelId: string; visionModelId?: string; parentVersionId?: string | null; instruction: string; reference?: LocalEditReference; rect: { x: number; y: number; width: number; height: number }; params?: Record<string, unknown> }) =>
     request<GenerateResult>(`/api/projects/${id}/local-edit`, { method: 'POST', body: JSON.stringify(input) }),
+  localEditBatch: (id: string, input: { imageId: string; modelId: string; visionModelId?: string; parentVersionId?: string | null; rect: { x: number; y: number; width: number; height: number }; instructions: string[]; reference?: LocalEditReference; params?: Record<string, unknown> }) =>
+    request<BatchEditResult>(`/api/projects/${id}/local-edit-batch`, { method: 'POST', body: JSON.stringify(input) }),
   outpaint: (id: string, input: { imageId: string; modelId: string; parentVersionId?: string | null; size: string; params?: Record<string, unknown> }) =>
     request<GenerateResult>(`/api/projects/${id}/outpaint`, { method: 'POST', body: JSON.stringify(input) }),
   enhance: (id: string, input: { imageId: string; modelId: string; parentVersionId?: string | null; params?: Record<string, unknown> }) =>

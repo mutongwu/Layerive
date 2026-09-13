@@ -20,14 +20,14 @@ const MODELS_CONFIG_PATH = path.join(CONFIG_ROOT, 'models.json');
 const startupRecoveryAt = now();
 db.prepare("UPDATE generation_tasks SET status = 'failed', error_json = ?, finished_at = ? WHERE status = 'generating'")
   .run(JSON.stringify({ message: '应用重启，任务已中断，请重新发送。' }), startupRecoveryAt);
-// A batch-edit version is published incrementally. Preserve completed outputs
+// A batch version is published incrementally. Preserve completed outputs
 // after a restart, but hide an empty placeholder version that never produced an
 // image before the process stopped.
 db.prepare(`
   UPDATE image_versions
   SET status = CASE WHEN EXISTS (SELECT 1 FROM images WHERE images.version_id = image_versions.id) THEN 'partial' ELSE 'failed' END,
       deleted_at = CASE WHEN EXISTS (SELECT 1 FROM images WHERE images.version_id = image_versions.id) THEN deleted_at ELSE COALESCE(deleted_at, ?) END
-  WHERE operation_type = 'batch_edit' AND status = 'generating'
+  WHERE operation_type IN ('batch_edit', 'batch_generate') AND status = 'generating'
 `).run(startupRecoveryAt);
 
 const runningTasks = new Map();
@@ -1121,7 +1121,7 @@ function batchMessageBatch(validated, extras) {
 
 function batchEditProgress(projectId, taskId) {
   projectOrThrow(projectId);
-  const task = db.prepare("SELECT * FROM generation_tasks WHERE id = ? AND project_id = ? AND operation_type = 'batch_edit'").get(taskId, projectId);
+  const task = db.prepare("SELECT * FROM generation_tasks WHERE id = ? AND project_id = ? AND operation_type IN ('batch_edit', 'batch_generate')").get(taskId, projectId);
   if (!task) throw Object.assign(new Error('批量处理任务不存在'), { status: 404 });
   const input = parseJson(task.input_json);
   const batch = input.batch || {};
@@ -1150,6 +1150,8 @@ function batchEditProgress(projectId, taskId) {
     status: task.status,
     versionId: input.versionId || null,
     versionNumber: Number(input.versionNumber) || null,
+    localEdit: Boolean(input.localEdit),
+    textBatch: Boolean(input.textBatch),
     template: String(batch.template || ''),
     variableNames,
     total: Number(batch.total || items.length),
@@ -1317,6 +1319,352 @@ async function runBatchEditTask(projectId, taskId, context) {
         db.prepare('INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)').run(uid(), projectId, 'assistant', 'result', JSON.stringify({ prompt: batchPromptSummary(validated), operation: 'batch_edit', outputImageIds: successful.map((item) => item.imageId), prompts: successful.map((item) => item.prompt), versionId, versionNumber, taskId, modelName: model.name, message, batch: batchMessageBatch(validated, { completed: successful.length, failed: items.filter((item) => item.status === 'failed').length, canceled }) }), finishedAt);
       } else {
         db.prepare('INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)').run(uid(), projectId, 'assistant', canceled ? 'canceled' : 'error', JSON.stringify({ message, taskId, prompt: batchPromptSummary(validated) }), finishedAt);
+      }
+      db.exec('COMMIT');
+    } catch (transactionError) { db.exec('ROLLBACK'); console.error(transactionError); }
+  }
+}
+
+// ---- Incremental batch text-to-image ---------------------------------------
+// 复用批量任务的增量发布框架，但不带输入图：变量模板逐行替换变量、提示词列表
+// 逐行作为完整提示词，可选的统一风格提示词追加到每一条提示词末尾。
+
+function startBatchGenerate(projectId, input) {
+  projectOrThrow(projectId);
+  const config = readModels();
+  const requestedModelId = String(input.modelId || '').trim();
+  const model = config.models.find((item) => item.id === (requestedModelId || config.active_model));
+  if (!model || model.type === 'vision') throw Object.assign(new Error('请选择有效的图片生成模型'), { status: 400 });
+  if (!model.capabilities.includes('text_to_image')) throw Object.assign(new Error('当前模型不支持文生图'), { status: 400 });
+  const validated = validateBatchEditInput(input);
+  const stylePrompt = String(input.stylePrompt || '').trim();
+  if (stylePrompt.length > 2000) throw Object.assign(new Error('统一风格提示词不能超过 2000 个字符'), { status: 400 });
+  const params = { ...model.defaultParams, ...(input.params || {}), count: 1 };
+  const taskId = uid();
+  const userMessageId = uid();
+  const versionId = uid();
+  const createdAt = now();
+  const versionNumber = Number(db.prepare('SELECT COALESCE(MAX(version_number), 0) + 1 AS next FROM image_versions WHERE project_id = ?').get(projectId).next);
+  const items = batchItemsFor(validated);
+  const promptSummary = validated.prompts
+    ? `批量文生图：共 ${validated.prompts.length} 条提示词${stylePrompt ? '，附加统一风格' : ''}，逐张生成。`
+    : `批量文生图：模板「${validated.template}」共 ${validated.quantity} 张${stylePrompt ? '，附加统一风格' : ''}。`;
+  const taskInput = () => {
+    const activeIndex = items.findIndex((item) => item.status === 'generating');
+    return { versionId, versionNumber, textBatch: true, batch: { template: validated.template, prompts: validated.prompts, variableNames: validated.variableNames, total: validated.quantity, currentIndex: activeIndex >= 0 ? activeIndex : null, items } };
+  };
+  db.exec('BEGIN');
+  try {
+    db.prepare('INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)').run(userMessageId, projectId, 'user', 'prompt', JSON.stringify({ prompt: promptSummary, operation: 'batch_generate', params: { ...params, quantity: validated.quantity }, modelName: model.name, batch: batchMessageBatch(validated, {}) }), createdAt);
+    db.prepare(`INSERT INTO generation_tasks (id, project_id, user_message_id, operation_type, model_id, model_snapshot_json, params_json, input_json, status, started_at, created_at)
+      VALUES (?, ?, ?, 'batch_generate', ?, ?, ?, ?, 'generating', ?, ?)`)
+      .run(taskId, projectId, userMessageId, model.id, JSON.stringify({ ...model, apiKey: undefined }), JSON.stringify(params), JSON.stringify(taskInput()), createdAt, createdAt);
+    db.prepare(`INSERT INTO image_versions (id, project_id, task_id, parent_version_id, version_number, operation_type, selected_image_id, status, created_at)
+      VALUES (?, ?, ?, ?, ?, 'batch_generate', NULL, 'generating', ?)`)
+      .run(versionId, projectId, taskId, input.parentVersionId || null, versionNumber, createdAt);
+    db.exec('COMMIT');
+  } catch (error) { db.exec('ROLLBACK'); throw error; }
+
+  const controller = new AbortController();
+  runningTasks.set(taskId, controller);
+  const timeoutMs = Math.min(3 * 60 * 60 * 1000, 120000 + validated.quantity * 180000);
+  const timer = setTimeout(() => controller.abort(new Error('timeout')), timeoutMs);
+  void runBatchGenerateTask(projectId, taskId, { model, params, versionId, versionNumber, validated, stylePrompt, promptSummary, taskInput, controller }).finally(() => {
+    clearTimeout(timer);
+    runningTasks.delete(taskId);
+    canceledTasks.delete(taskId);
+  });
+  return { taskId, versionId, status: 'generating', userMessageId };
+}
+
+async function runBatchGenerateTask(projectId, taskId, context) {
+  const { model, params, versionId, versionNumber, validated, stylePrompt, promptSummary, taskInput, controller } = context;
+  const successful = [];
+  try {
+    if (!model.apiKey && model.provider !== 'mock') throw new Error('模型尚未配置 API Key');
+    for (const item of taskInput().batch.items) {
+      controller.signal.throwIfAborted();
+      const startedAt = Date.now();
+      item.status = 'generating';
+      item.startedAt = new Date(startedAt).toISOString();
+      db.prepare('UPDATE generation_tasks SET input_json = ? WHERE id = ?').run(JSON.stringify(taskInput()), taskId);
+      // 文生图批次不带参考图，不叠加“保持参考图一致”的批次约束；
+      // 统一风格追加到每条最终提示词，保证整批画风统一。
+      const basePrompt = validated.prompts ? validated.prompts[item.index] : applyBatchVariables(validated.template, item.values);
+      const prompt = stylePrompt ? `${basePrompt}，${stylePrompt}` : basePrompt;
+      try {
+        let output;
+        if (model.provider === 'mock') {
+          const { width, height } = parseSize(params.size);
+          const scale = Math.min(1, 1024 / Math.max(width, height));
+          const outputWidth = Math.round(width * scale);
+          const outputHeight = Math.round(height * scale);
+          await abortableDelay(300, controller.signal);
+          output = { bytes: makeDemoPng(prompt, outputWidth, outputHeight, item.index), mimeType: 'image/png', width: outputWidth, height: outputHeight };
+        } else {
+          [output] = await callImageWithRetry(model, prompt, { ...params, count: 1 }, null, controller.signal);
+        }
+        controller.signal.throwIfAborted();
+        const dimensions = readImageDimensions(output.bytes, output.mimeType) || parseSize(params.size);
+        const imageId = uid();
+        const extension = output.mimeType.includes('jpeg') ? 'jpg' : output.mimeType.includes('webp') ? 'webp' : 'png';
+        const relative = path.join('generated', `${imageId}.${extension}`);
+        await writeFile(path.join(PROJECTS_ROOT, projectId, relative), output.bytes);
+        controller.signal.throwIfAborted();
+        item.status = 'success';
+        item.imageId = imageId;
+        item.prompt = prompt;
+        item.durationMs = Math.max(1, Date.now() - startedAt);
+        item.finishedAt = now();
+        successful.push({ imageId, prompt });
+        const firstOutput = successful.length === 1;
+        db.exec('BEGIN');
+        try {
+          db.prepare(`INSERT INTO images (id, project_id, version_id, task_id, source_type, file_path, mime_type, width, height, file_size, created_at)
+            VALUES (?, ?, ?, ?, 'generated', ?, ?, ?, ?, ?, ?)`)
+            .run(imageId, projectId, versionId, taskId, relative, output.mimeType, output.width || dimensions.width, output.height || dimensions.height, output.bytes.length, item.finishedAt);
+          if (firstOutput) db.prepare('UPDATE image_versions SET selected_image_id = ? WHERE id = ?').run(imageId, versionId);
+          db.prepare('UPDATE generation_tasks SET input_json = ? WHERE id = ?').run(JSON.stringify(taskInput()), taskId);
+          if (firstOutput) {
+            db.prepare('UPDATE projects SET current_version_id = ?, current_image_id = ?, cover_image_id = ?, updated_at = ? WHERE id = ?')
+              .run(versionId, imageId, imageId, item.finishedAt, projectId);
+          } else {
+            db.prepare('UPDATE projects SET updated_at = ? WHERE id = ?').run(item.finishedAt, projectId);
+          }
+          db.exec('COMMIT');
+        } catch (error) { db.exec('ROLLBACK'); throw error; }
+      } catch (error) {
+        if (controller.signal.aborted || error.name === 'AbortError') throw error;
+        item.status = 'failed';
+        item.error = friendlyModelMessage(error.message);
+        item.durationMs = Math.max(1, Date.now() - startedAt);
+        item.finishedAt = now();
+        db.prepare('UPDATE generation_tasks SET input_json = ? WHERE id = ?').run(JSON.stringify(taskInput()), taskId);
+      }
+    }
+    const finishedAt = now();
+    const failedCount = taskInput().batch.items.filter((item) => item.status === 'failed').length;
+    const status = successful.length ? (failedCount ? 'partial' : 'success') : 'failed';
+    const message = successful.length
+      ? `批量文生图已完成 ${successful.length}/${validated.quantity} 张${failedCount ? `，${failedCount} 张失败` : ''}。`
+      : '批量文生图未生成可用图片。';
+    db.exec('BEGIN');
+    try {
+      db.prepare('UPDATE generation_tasks SET status = ?, input_json = ?, error_json = ?, finished_at = ? WHERE id = ?')
+        .run(status, JSON.stringify(taskInput()), failedCount ? JSON.stringify({ message }) : null, finishedAt, taskId);
+      db.prepare('UPDATE image_versions SET status = ?, deleted_at = ? WHERE id = ?')
+        .run(status, successful.length ? null : finishedAt, versionId);
+      if (successful.length) {
+        db.prepare('INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)').run(uid(), projectId, 'assistant', 'result', JSON.stringify({ prompt: promptSummary, operation: 'batch_generate', outputImageIds: successful.map((item) => item.imageId), prompts: successful.map((item) => item.prompt), versionId, versionNumber, taskId, modelName: model.name, batch: batchMessageBatch(validated, { completed: successful.length, failed: failedCount }) }), finishedAt);
+      } else {
+        db.prepare('INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)').run(uid(), projectId, 'assistant', 'error', JSON.stringify({ message, taskId, prompt: promptSummary }), finishedAt);
+      }
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  } catch (error) {
+    const finishedAt = now();
+    const canceled = canceledTasks.has(taskId) || (error.name === 'AbortError' && !controller.signal.reason?.message?.includes('timeout'));
+    const message = canceled ? '已取消批量文生图，已生成的图片会继续保留。' : friendlyModelMessage(error.message);
+    const currentItems = taskInput().batch.items;
+    const activeItem = currentItems.find((item) => item.status === 'generating');
+    if (activeItem) {
+      activeItem.status = canceled ? 'canceled' : 'failed';
+      activeItem.error = message;
+      activeItem.durationMs = activeItem.startedAt ? Math.max(1, Date.now() - Date.parse(activeItem.startedAt)) : null;
+      activeItem.finishedAt = finishedAt;
+    }
+    const status = canceled ? 'canceled' : successful.length ? 'partial' : 'failed';
+    db.exec('BEGIN');
+    try {
+      db.prepare('UPDATE generation_tasks SET status = ?, input_json = ?, error_json = ?, finished_at = ? WHERE id = ?')
+        .run(status, JSON.stringify(taskInput()), JSON.stringify({ message }), finishedAt, taskId);
+      db.prepare('UPDATE image_versions SET status = ?, deleted_at = ? WHERE id = ?')
+        .run(successful.length ? 'partial' : status, successful.length ? null : finishedAt, versionId);
+      if (successful.length) {
+        db.prepare('INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)').run(uid(), projectId, 'assistant', 'result', JSON.stringify({ prompt: promptSummary, operation: 'batch_generate', outputImageIds: successful.map((item) => item.imageId), prompts: successful.map((item) => item.prompt), versionId, versionNumber, taskId, modelName: model.name, message, batch: batchMessageBatch(validated, { completed: successful.length, failed: currentItems.filter((item) => item.status === 'failed').length, canceled }) }), finishedAt);
+      } else {
+        db.prepare('INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)').run(uid(), projectId, 'assistant', canceled ? 'canceled' : 'error', JSON.stringify({ message, taskId, prompt: promptSummary }), finishedAt);
+      }
+      db.exec('COMMIT');
+    } catch (transactionError) { db.exec('ROLLBACK'); console.error(transactionError); }
+  }
+}
+
+// ---- Incremental batch regional editing ------------------------------------
+// 复用批量任务的增量发布框架，但每个子项走局部修改流水线：
+// 视觉规划 →（有参考图时）合成 → 生成 → 框外像素保留，全部输出进入同一版本。
+
+function startLocalEditBatch(projectId, input) {
+  projectOrThrow(projectId);
+  const config = readModels();
+  const visionModel = visionModelOrThrow(config, input.visionModelId);
+  if (!visionModel.apiKey) throw Object.assign(new Error('请先配置视觉识别模型的 API Key'), { status: 400 });
+  const rect = validateRect(input.rect);
+  if (rect.width < 1 || rect.height < 1) throw Object.assign(new Error('框选区域太小，请重新框选'), { status: 400 });
+  const reference = input.reference == null ? null : referenceBytes(input.reference);
+  const instructions = (Array.isArray(input.instructions) ? input.instructions : []).map((value) => String(value ?? '').trim()).filter(Boolean);
+  if (instructions.length < 2 || instructions.length > BATCH_EDIT_MAX_ITEMS) {
+    throw Object.assign(new Error(`批量局部修改需 2–${BATCH_EDIT_MAX_ITEMS} 条指令`), { status: 400 });
+  }
+  const tooLongIndex = instructions.findIndex((value) => value.length > 1000);
+  if (tooLongIndex >= 0) throw Object.assign(new Error(`第 ${tooLongIndex + 1} 条指令不能超过 1000 个字符`), { status: 400 });
+  const requestedModelId = String(input.modelId || '').trim();
+  const model = config.models.find((item) => item.id === (requestedModelId || config.active_model));
+  if (!model || model.type === 'vision') throw Object.assign(new Error('请选择有效的图片生成模型'), { status: 400 });
+  if (!model.capabilities.includes('edit_prompt')) throw Object.assign(new Error('当前模型不支持提示词改图'), { status: 400 });
+  const source = ensureUploadVersion(projectId, imageOrThrow(projectId, input.imageId));
+  const params = { ...model.defaultParams, ...(input.params || {}), count: 1 };
+  if (reference) { params.outputFormat = 'png'; params.transparent = false; }
+  const taskId = uid();
+  const userMessageId = uid();
+  const versionId = uid();
+  const createdAt = now();
+  const versionNumber = Number(db.prepare('SELECT COALESCE(MAX(version_number), 0) + 1 AS next FROM image_versions WHERE project_id = ?').get(projectId).next);
+  const promptSummary = `批量局部修改：共 ${instructions.length} 条指令，逐张处理同一选区。`;
+  const items = instructions.map((instruction, index) => ({ index, values: { 指令: instruction }, status: 'pending' }));
+  const taskInput = { inputImageId: source.id, versionId, versionNumber, localEdit: { rect, hasReference: Boolean(reference), visionModelId: visionModel.id }, batch: { prompts: instructions, local: true, total: instructions.length, currentIndex: null, items } };
+  db.exec('BEGIN');
+  try {
+    db.prepare('INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)').run(userMessageId, projectId, 'user', 'prompt', JSON.stringify({ prompt: promptSummary, operation: 'local_edit', inputImageId: source.id, params: { ...params, quantity: instructions.length }, modelName: model.name, batch: { local: true, prompts: instructions } }), createdAt);
+    db.prepare(`INSERT INTO generation_tasks (id, project_id, user_message_id, operation_type, model_id, model_snapshot_json, params_json, input_json, status, started_at, created_at)
+      VALUES (?, ?, ?, 'batch_edit', ?, ?, ?, ?, 'generating', ?, ?)`)
+      .run(taskId, projectId, userMessageId, model.id, JSON.stringify({ ...model, apiKey: undefined }), JSON.stringify(params), JSON.stringify(taskInput), createdAt, createdAt);
+    db.prepare(`INSERT INTO image_versions (id, project_id, task_id, parent_version_id, version_number, operation_type, selected_image_id, status, created_at)
+      VALUES (?, ?, ?, ?, ?, 'local_edit', NULL, 'generating', ?)`)
+      .run(versionId, projectId, taskId, input.parentVersionId || source.version_id || null, versionNumber, createdAt);
+    db.prepare('INSERT OR IGNORE INTO version_inputs VALUES (?, ?, ?)').run(versionId, source.id, 'source');
+    db.exec('COMMIT');
+  } catch (error) { db.exec('ROLLBACK'); throw error; }
+
+  const controller = new AbortController();
+  runningTasks.set(taskId, controller);
+  const timeoutMs = Math.min(3 * 60 * 60 * 1000, 120000 + instructions.length * 240000);
+  const timer = setTimeout(() => controller.abort(new Error('timeout')), timeoutMs);
+  void runLocalEditBatchTask(projectId, taskId, { model, source, params, versionId, versionNumber, rect, reference, visionModel, instructions, promptSummary, controller }).finally(() => {
+    clearTimeout(timer);
+    runningTasks.delete(taskId);
+    canceledTasks.delete(taskId);
+  });
+  return { taskId, versionId, status: 'generating', userMessageId };
+}
+
+async function runLocalEditBatchTask(projectId, taskId, context) {
+  const { model, source, params, versionId, versionNumber, rect, reference, visionModel, instructions, promptSummary, controller } = context;
+  const items = instructions.map((instruction, index) => ({ index, values: { 指令: instruction }, status: 'pending' }));
+  const successful = [];
+  const taskInput = () => {
+    const activeIndex = items.findIndex((item) => item.status === 'generating');
+    return { inputImageId: source.id, versionId, versionNumber, localEdit: { rect, hasReference: Boolean(reference), visionModelId: visionModel.id }, batch: { prompts: instructions, local: true, total: instructions.length, currentIndex: activeIndex >= 0 ? activeIndex : null, items } };
+  };
+  try {
+    if (!model.apiKey && model.provider !== 'mock') throw new Error('模型尚未配置 API Key');
+    for (let index = 0; index < items.length; index += 1) {
+      controller.signal.throwIfAborted();
+      const item = items[index];
+      const startedAt = Date.now();
+      item.status = 'generating';
+      item.startedAt = new Date(startedAt).toISOString();
+      db.prepare('UPDATE generation_tasks SET input_json = ? WHERE id = ?').run(JSON.stringify(taskInput()), taskId);
+      try {
+        const prepared = await prepareLocalEdit(projectId, taskId, source, { rect, instruction: instructions[index], reference, visionModel }, controller.signal);
+        let output;
+        if (model.provider === 'mock') {
+          const { width, height } = parseSize(params.size);
+          const scale = Math.min(1, 1024 / Math.max(width, height));
+          const outputWidth = Math.round(width * scale);
+          const outputHeight = Math.round(height * scale);
+          await abortableDelay(300, controller.signal);
+          output = { bytes: makeDemoPng(prepared.prompt, outputWidth, outputHeight, index), mimeType: 'image/png', width: outputWidth, height: outputHeight };
+        } else {
+          [output] = await callImageWithRetry(model, prepared.prompt, { ...params, count: 1 }, prepared.image, controller.signal);
+        }
+        controller.signal.throwIfAborted();
+        if (prepared.source) {
+          updateTaskInput(taskId, { stage: 'preserving' });
+          output = await preserveOutsideRegion(prepared.source, output, rect);
+          controller.signal.throwIfAborted();
+        }
+        const dimensions = readImageDimensions(output.bytes, output.mimeType) || parseSize(params.size);
+        const imageId = uid();
+        const extension = output.mimeType.includes('jpeg') ? 'jpg' : output.mimeType.includes('webp') ? 'webp' : 'png';
+        const relative = path.join('generated', `${imageId}.${extension}`);
+        await writeFile(path.join(PROJECTS_ROOT, projectId, relative), output.bytes);
+        controller.signal.throwIfAborted();
+        item.status = 'success';
+        item.imageId = imageId;
+        item.prompt = prepared.prompt;
+        item.durationMs = Math.max(1, Date.now() - startedAt);
+        item.finishedAt = now();
+        successful.push({ imageId, prompt: prepared.prompt });
+        const firstOutput = successful.length === 1;
+        db.exec('BEGIN');
+        try {
+          db.prepare(`INSERT INTO images (id, project_id, version_id, task_id, source_type, file_path, mime_type, width, height, file_size, created_at)
+            VALUES (?, ?, ?, ?, 'generated', ?, ?, ?, ?, ?, ?)`)
+            .run(imageId, projectId, versionId, taskId, relative, output.mimeType, output.width || dimensions.width, output.height || dimensions.height, output.bytes.length, item.finishedAt);
+          if (firstOutput) db.prepare('UPDATE image_versions SET selected_image_id = ? WHERE id = ?').run(imageId, versionId);
+          for (const material of db.prepare("SELECT id, source_type FROM images WHERE task_id = ? AND source_type IN ('local_reference', 'local_composite')").all(taskId)) {
+            db.prepare('INSERT OR IGNORE INTO version_inputs VALUES (?, ?, ?)').run(versionId, material.id, material.source_type);
+          }
+          db.prepare('UPDATE generation_tasks SET input_json = ? WHERE id = ?').run(JSON.stringify(taskInput()), taskId);
+          if (firstOutput) {
+            db.prepare('UPDATE projects SET current_version_id = ?, current_image_id = ?, cover_image_id = ?, updated_at = ? WHERE id = ?')
+              .run(versionId, imageId, imageId, item.finishedAt, projectId);
+          } else {
+            db.prepare('UPDATE projects SET updated_at = ? WHERE id = ?').run(item.finishedAt, projectId);
+          }
+          db.exec('COMMIT');
+        } catch (error) { db.exec('ROLLBACK'); throw error; }
+      } catch (error) {
+        if (controller.signal.aborted || error.name === 'AbortError') throw error;
+        item.status = 'failed';
+        item.error = friendlyModelMessage(error.message);
+        item.durationMs = Math.max(1, Date.now() - startedAt);
+        item.finishedAt = now();
+        db.prepare('UPDATE generation_tasks SET input_json = ? WHERE id = ?').run(JSON.stringify(taskInput()), taskId);
+      }
+    }
+    const finishedAt = now();
+    const failures = items.filter((item) => item.status === 'failed').length;
+    const status = successful.length ? (failures ? 'partial' : 'success') : 'failed';
+    const message = successful.length
+      ? `批量局部修改已完成 ${successful.length}/${items.length} 张${failures ? `，${failures} 张失败` : ''}。`
+      : '批量局部修改未生成可用图片。';
+    db.exec('BEGIN');
+    try {
+      db.prepare('UPDATE generation_tasks SET status = ?, input_json = ?, error_json = ?, finished_at = ? WHERE id = ?')
+        .run(status, JSON.stringify(taskInput()), failures ? JSON.stringify({ message }) : null, finishedAt, taskId);
+      db.prepare('UPDATE image_versions SET status = ?, deleted_at = ? WHERE id = ?')
+        .run(status, successful.length ? null : finishedAt, versionId);
+      if (successful.length) {
+        db.prepare('INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)').run(uid(), projectId, 'assistant', 'result', JSON.stringify({ prompt: promptSummary, operation: 'local_edit', outputImageIds: successful.map((item) => item.imageId), prompts: successful.map((item) => item.prompt), versionId, versionNumber, taskId, modelName: model.name, batch: { local: true, prompts: instructions, completed: successful.length, failed: failures } }), finishedAt);
+      } else {
+        db.prepare('INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)').run(uid(), projectId, 'assistant', 'error', JSON.stringify({ message, taskId, prompt: promptSummary }), finishedAt);
+      }
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  } catch (error) {
+    const finishedAt = now();
+    const canceled = canceledTasks.has(taskId) || (error.name === 'AbortError' && !controller.signal.reason?.message?.includes('timeout'));
+    const message = canceled ? '已取消批量局部修改，已生成的图片会继续保留。' : friendlyModelMessage(error.message);
+    const activeItem = items.find((item) => item.status === 'generating');
+    if (activeItem) {
+      activeItem.status = canceled ? 'canceled' : 'failed';
+      activeItem.error = message;
+      activeItem.durationMs = activeItem.startedAt ? Math.max(1, Date.now() - Date.parse(activeItem.startedAt)) : null;
+      activeItem.finishedAt = finishedAt;
+    }
+    const status = canceled ? 'canceled' : successful.length ? 'partial' : 'failed';
+    db.exec('BEGIN');
+    try {
+      db.prepare('UPDATE generation_tasks SET status = ?, input_json = ?, error_json = ?, finished_at = ? WHERE id = ?')
+        .run(status, JSON.stringify(taskInput()), JSON.stringify({ message }), finishedAt, taskId);
+      db.prepare('UPDATE image_versions SET status = ?, deleted_at = ? WHERE id = ?')
+        .run(successful.length ? 'partial' : status, successful.length ? null : finishedAt, versionId);
+      if (successful.length) {
+        db.prepare('INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)').run(uid(), projectId, 'assistant', 'result', JSON.stringify({ prompt: promptSummary, operation: 'local_edit', outputImageIds: successful.map((item) => item.imageId), prompts: successful.map((item) => item.prompt), versionId, versionNumber, taskId, modelName: model.name, message, batch: { local: true, prompts: instructions, completed: successful.length, failed: items.filter((item) => item.status === 'failed').length, canceled } }), finishedAt);
+      } else {
+        db.prepare('INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)').run(uid(), projectId, 'assistant', canceled ? 'canceled' : 'error', JSON.stringify({ message, taskId, prompt: promptSummary }), finishedAt);
       }
       db.exec('COMMIT');
     } catch (transactionError) { db.exec('ROLLBACK'); console.error(transactionError); }
@@ -1835,8 +2183,12 @@ const server = http.createServer(async (req, res) => {
     if (extractMatch && req.method === 'POST') return json(res, 202, await extractImageAsset(extractMatch[1], await body(req)));
     const batchEditStartMatch = pathname.match(/^\/api\/projects\/([^/]+)\/batch-edit$/);
     if (batchEditStartMatch && req.method === 'POST') return json(res, 202, startBatchEdit(batchEditStartMatch[1], await body(req)));
+    const batchGenerateMatch = pathname.match(/^\/api\/projects\/([^/]+)\/batch-generate$/);
+    if (batchGenerateMatch && req.method === 'POST') return json(res, 202, startBatchGenerate(batchGenerateMatch[1], await body(req)));
     const batchEditProgressMatch = pathname.match(/^\/api\/projects\/([^/]+)\/batch-edits\/([^/]+)$/);
     if (batchEditProgressMatch && req.method === 'GET') return json(res, 200, batchEditProgress(batchEditProgressMatch[1], batchEditProgressMatch[2]));
+    const localEditBatchMatch = pathname.match(/^\/api\/projects\/([^/]+)\/local-edit-batch$/);
+    if (localEditBatchMatch && req.method === 'POST') return json(res, 202, startLocalEditBatch(localEditBatchMatch[1], await body(req)));
 
     const tasksMatch = pathname.match(/^\/api\/projects\/([^/]+)\/tasks$/);
     if (tasksMatch && req.method === 'GET') return json(res, 200, { tasks: listGeneratingTasks(tasksMatch[1]) });
