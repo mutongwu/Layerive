@@ -32,10 +32,16 @@ jobs:
           node-version: '22.13'
           cache: npm
 
-      # sharp is native: install optional binaries for the target architecture.
-      - run: npm ci --cpu=${{ matrix.arch }}
+      # Frontend build runs on the HOST architecture: rollup/esbuild ship
+      # native binaries and must match the runner's real CPU (an arm64 runner
+      # forced to --cpu=x64 cannot execute the x64 rollup module).
+      - run: npm ci
 
       - run: npm run build
+
+      # sharp is native: before packaging, reinstall with optional binaries
+      # for the TARGET architecture so extraResources ships the right build.
+      - run: npm ci --cpu=${{ matrix.arch }}
 
       # No code signing is configured, so skip the automatic certificate
       # lookup; unsigned installers are published as-is.
