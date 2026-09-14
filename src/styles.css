@@ -920,6 +920,7 @@ html[data-theme='dark'] .workspace-loading { background: var(--canvas); }
 html[data-theme='dark'] .workspace-topbar { background: #1b1e25; border-bottom-color: var(--line-soft); }
 html[data-theme='dark'] .header-divider { background: #2c2f38; }
 html[data-theme='dark'] .project-name-field > svg { color: #6b707a; }
+html[data-theme='dark'] .project-name-field:hover > svg { color: var(--accent); }
 html[data-theme='dark'] .project-name-input { color: #e8eaf0; }
 html[data-theme='dark'] .project-name-input:hover, html[data-theme='dark'] .project-name-input:focus { background: #22252d; }
 html[data-theme='dark'] .workspace-header-actions select { background: #262932; border-color: #32353f; color: #d5d8e0; }
