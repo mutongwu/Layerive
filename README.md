@@ -8,7 +8,7 @@
 
 **A local workspace that keeps images, conversations, and edit history together by project.**
 
-<video src="docs/assets/layerive-overview.mp4" poster="docs/assets/layerive-overview-poster.jpg" controls preload="metadata" width="100%"></video>
+[![Watch the Layerive product tour](docs/assets/layerive-overview-poster.jpg)](docs/assets/layerive-overview.mp4)
 
 **[▶ Watch the 1:47 product tour](docs/assets/layerive-overview.mp4)** — projects, text-to-image, regional editing, text editing, asset extraction, reference-image replacement, batch generation, version history, comparison, and the prompt gallery.
 

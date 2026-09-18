@@ -8,7 +8,7 @@
 
 **一个按项目管理图片、对话和修改历史的本地创作工作台。**
 
-<video src="docs/assets/layerive-overview.mp4" poster="docs/assets/layerive-overview-poster.jpg" controls preload="metadata" width="100%"></video>
+[![观看 Layerive 功能演示](docs/assets/layerive-overview-poster.jpg)](docs/assets/layerive-overview.mp4)
 
 **[▶ 观看 1 分 47 秒功能演示](docs/assets/layerive-overview.mp4)** — 创建项目、文生图、局部修改、图片改字、提取素材、参考图替换、批量生图、版本管理、图片对比和提示词画廊。
 
