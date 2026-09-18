@@ -8,6 +8,10 @@
 
 **一个按项目管理图片、对话和修改历史的本地创作工作台。**
 
+<video src="docs/assets/layerive-overview.mp4" poster="docs/assets/layerive-overview-poster.jpg" controls preload="metadata" width="100%"></video>
+
+**[▶ 观看 1 分 47 秒功能演示](docs/assets/layerive-overview.mp4)** — 创建项目、文生图、局部修改、图片改字、提取素材、参考图替换、批量生图、版本管理、图片对比和提示词画廊。
+
 Layerive 用来处理需要反复修改的图片工作。你可以从提示词或已有图片开始，继续改图、改字、局部替换、扩图和提取素材；每次结果都保存为项目中的一个版本，相关图片、对话和模型配置留在本机。
 
 [![本地运行](https://img.shields.io/badge/本地运行-无需登录-6d55f7)](#本地数据与隐私)
