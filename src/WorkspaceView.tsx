@@ -606,6 +606,9 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
   function chooseVersion(version: Version) {
     const image = version.outputs.find((item) => item.id === version.selectedImageId) || version.outputs[0];
     if (image) setCurrentImageId(image.id);
+    // 批量结果面板只属于其产出的版本。查看其他历史版本时收起它，避免
+    // 把上一轮批量结果误当成当前画布的候选图。
+    setBatchProgress((progress) => progress?.versionId === version.id ? progress : null);
   }
 
   // Start an edit straight from a history entry: its image becomes the next
@@ -671,6 +674,7 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
 
   async function openTextEditor() {
     if (!currentImage) return;
+    setRightMode('chat');
     setTextImageId(currentImage.id);
     setTextSegments([]);
     setRecognitionModel('');
@@ -816,6 +820,7 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
 
   function startLocalEdit() {
     if (!currentImage || generating) return;
+    setRightMode('chat');
     closeOutpaint();
     closeExtract();
     setLocalEditMode(true);
@@ -907,6 +912,7 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
 
   function startOutpaint() {
     if (!currentImage || generating) return;
+    setRightMode('chat');
     closeLocalEdit();
     closeExtract();
     const availableSizes = sizesForProvider(provider);
@@ -943,6 +949,7 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
   // 只包含该主体的独立素材图。
   function startExtract() {
     if (!currentImage || generating) return;
+    setRightMode('chat');
     closeLocalEdit();
     closeOutpaint();
     setExtractMode(true);
@@ -986,6 +993,7 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
 
   async function enhanceImage() {
     if (!currentImage || enhancing || generating) return;
+    setRightMode('chat');
     setEnhancing(true);
     try {
       const result = await api.enhance(projectId, {
@@ -1001,6 +1009,7 @@ export function WorkspaceView({ projectId, models, activeModel, activeVisionMode
 
   async function removeWatermark() {
     if (!currentImage || removingWatermark || generating) return;
+    setRightMode('chat');
     setRemovingWatermark(true);
     try {
       const result = await api.removeWatermark(projectId, {
