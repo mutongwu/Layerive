@@ -8,9 +8,9 @@
 
 **A local workspace that keeps images, conversations, and edit history together by project.**
 
-[![Watch the Layerive product tour](docs/assets/layerive-overview-poster.jpg)](docs/assets/layerive-overview.mp4)
+![Layerive product tour](docs/assets/layerive-overview.gif)
 
-**[▶ Watch the 1:47 product tour](docs/assets/layerive-overview.mp4)** — projects, text-to-image, regional editing, text editing, asset extraction, reference-image replacement, batch generation, version history, comparison, and the prompt gallery.
+**1:47 product tour** — projects, text-to-image, regional editing, text editing, asset extraction, reference-image replacement, batch generation, version history, comparison, and the prompt gallery.
 
 Layerive is built for image work that takes more than one prompt. Start from text or an existing image, then edit, replace a region, change text, outpaint, or extract an asset. Each result becomes a version in the project, while images, conversations, and model settings remain on your machine.
 
